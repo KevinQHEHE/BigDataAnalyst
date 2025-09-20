@@ -1,225 +1,100 @@
+# AQ Lakehouse — Vietnam Air Quality Pipeline
 
-# AQ Lakehouse — Air Quality Analytics Platform
+A modular lakehouse pipeline that ingests hourly air-quality measurements from the Open-Meteo API, stores them in an Iceberg-backed Bronze table, derives a Silver view for clean analytics, and maintains a daily Gold table for BI dashboards. The flow is idempotent, supports range replacement, and can rebuild downstream layers automatically.
 
-This repository implements a data lakehouse for hourly air quality analytics focused on provinces and cities in Vietnam. The README intentionally describes the system, data contracts, constraints, and examples in precise English so an AI or developer can reliably read the spec and generate code or tests.
+## Architecture at a glance
 
-## Summary
+- **Bronze (`hadoop_catalog.aq.raw_open_meteo_hourly`)** – Source-of-truth Iceberg table keyed by `(location_id, ts)`. Data is written via `MERGE` with per-run UUIDs and timestamps for lineage.
+- **Dim (`hadoop_catalog.aq.dim_locations`)** – Type 1 dimension carrying the authoritative latitude/longitude for each location.
+- **Silver (`spark_catalog.aq.v_silver_air_quality_hourly`)** – A view that cleans negative readings, keeps timestamps in UTC, and enriches with coordinates (backed by the session catalog while sourcing data from Iceberg Bronze).
+- **Gold (`hadoop_catalog.aq.gold_air_quality_daily`)** – Iceberg table storing per-day pollutant averages. Only affected `(location_id, date)` pairs are updated per run.
+- **Orchestration (`scripts/run_pipeline.sh`)** – Single command to run ingest → housekeeping → dimension/view refresh → incremental/full Gold update → data-quality checks → staging cleanup.
+- **Reset (`scripts/reset_pipeline_state.sh`)** – Optional utility to truncate/drop downstream artefacts and clear staging/cache files before a fresh rebuild.
 
-- Purpose: Ingest hourly air quality measurements from the Open-Meteo Air Quality API, store them in an Iceberg-backed lakehouse on HDFS, and provide transformed analytical tables for downstream consumption (dashboards, queries, ML). All ETL is run on demand (no scheduler).
-- Coverage: A fixed set of geographic points (latitude/longitude) that map to provinces/cities in Vietnam.
-- Timezone: Data are normalized and stored in timezone UTC+7. Source timestamps are converted to UTC+7 during ingestion.
+## Quick start
 
-## Technology Stack
+1. Install dependencies (Python 3.10+ recommended):
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. Make sure Spark and Hadoop clients can access `hdfs://khoa-master:9000/` and Iceberg extensions are available on the cluster.
+3. Run the full pipeline (submits Spark jobs to YARN):
+   ```bash
+   START=2024-01-01 END=2024-01-31 ./scripts/run_pipeline.sh
+   ```
+4. For a Gold rebuild after reloading Bronze entirely:
+   ```bash
+   START=2023-01-01 END=2025-12-31 FULL=true ./scripts/run_pipeline.sh
+   ```
 
-- Storage/Cluster: Hadoop Distributed File System (HDFS)
-- Compute: Apache Spark (PySpark or Scala Spark as implemented in this repo)
-- Table Format: Apache Iceberg
-- Catalog: Hadoop Catalog (Iceberg using Hadoop table metadata)
-- Visualization: Apache Superset (consumes Iceberg tables via SQL engine)
+### Environment knobs
 
-## Data Source
+- `START` / `END` — inclusive UTC dates for ingestion.
+- `MODE` — `upsert` (default) or `replace-range` (pre-delete range before merge).
+- `LOCATION_IDS` — optional space-separated list to ingest/delete only those locations.
+- `FULL` — `true` triggers a Gold truncate + rebuild from Silver.
+- `LOCATIONS_FILE` — override `configs/locations.json` if you maintain multiple location sets.
+- `CHUNK_DAYS` — adjust API chunking window (default `10`).
 
-- Source: Open-Meteo Air Quality API
-- API docs: https://open-meteo.com/en/docs/air-quality-api
-- Data resolution: hourly
-- Geographic scope: a predefined list of coordinates (latitude, longitude) for Vietnamese provinces/cities
+The script captures the `RUN_ID` emitted by the ingest job and passes it to the Gold merge so only impacted partitions are recomputed.
 
-Notes: The system queries the API for specific coordinates and does not attempt to discover or enumerate locations dynamically.
+## Ingestion job details
 
-## Constraints and Non-Functional Requirements
+`jobs/ingest/open_meteo_bronze.py` handles API access and Bronze writes (always submit via Spark/YARN using `script/submit_yarn.sh`).
 
-- No scheduler: ETL jobs are executed only when the corresponding code or script is called manually or from an orchestration tool outside this repo. There is intentionally no cron/airflow/automation setup in the repo.
-- Fixed locations: The pipeline accepts a static list of coordinates (and optional labels) defined in configuration. It does not fetch arbitrary locations.
-- Idempotency: Re-running an ingestion for the same time window and coordinate should not create duplicate records in Iceberg (use upserts/merge-on-key or partition overwrite semantics).
-- Data retention and partitioning strategies should be documented and easy to change in configuration.
+- Reads coordinates from `configs/locations.json` (keys are the `location_id`).
+- Uses a cached, retried Open-Meteo client with polite pacing (`time.sleep(0.2)` per API call).
+- Sanitises negative pollutant readings to `NULL` before writing.
+- Drops duplicate `(location_id, ts)` pairs within the fetched batch.
+- Writes through Iceberg `MERGE` so reruns update existing rows instead of duplicating them.
+- Prints `RUN_ID=<uuid>` on success and automatically runs Iceberg maintenance procedures.
 
-## Data Contracts
+Range replacement is achieved with `--mode replace-range` which issues an Iceberg `DELETE` for the requested window and location set before the merge. For incremental catch-up runs, use `--update-from-db` to start from the next hour after the current `MAX(ts)`.
 
-1. Ingested raw record (per hour, per coordinate):
+## Data layers
 
-- source_timestamp_utc: string (ISO 8601 in UTC)
-- local_timestamp: string (ISO 8601 converted to UTC+7)
-- latitude: float
-- longitude: float
-- location_id: string (stable id for the coordinate; e.g., `vn_hanoi_1`)
-- location_name: string (human label, e.g., `Hanoi - Hoan Kiem`)
-- measurements: map<string, double> (keys are pollutant codes such as pm10, pm2_5, no2, o3, so2, co)
-- raw_payload: string (optional, the original JSON from the API for audit/debug)
+| Layer | Contract | Partitioning | Notes |
+| --- | --- | --- | --- |
+| Bronze | hourly metrics, lat/lon, `run_id`, `ingested_at` | `days(ts)` | Format v2, hash distribution, 128 MB target files |
+| Silver | view fields: `location_id`, `ts_utc`, `date`, pollutant columns, `lat`, `lon`, `run_id`, `ingested_at` | n/a | exposes Bronze data cleaned and ready for joins |
+| Gold | daily averages: `pm25_avg_24h`, `pm10_avg_24h`, `no2_avg_24h`, `o3_avg_24h`, `so2_avg_24h`, `co_avg_24h`, `uv_index_avg`, `uv_index_cs_avg`, `aod_avg` | `(date, location_id)` | Upsert per `RUN_ID`; rebuildable in one pass |
 
-Notes: The pipeline stores a copy of the raw API response (raw_payload) per ingestion run into a raw audit folder (for example `data/raw/`). This raw capture is important for replay, debugging, and building mocked responses for tests.
+Adding new KPIs (e.g., AQI calculations, rolling windows) follows the same pattern—derive from Silver keyed by date/location and merge only the changed slices.
 
-2. Canonical analytics table (Iceberg) example schema:
+## Data quality and housekeeping
 
-- event_time_utc: timestamp
-- event_time_local: timestamp (UTC+7)
-- location_id: string
-- location_name: string
-- latitude: double
-- longitude: double
-- pm2_5: double
-- pm10: double
-- no2: double
-- so2: double
-- o3: double
-- co: double
-- aqi: int (optional — computed)
-- ingestion_time: timestamp
+- The pipeline runs null, duplication, and pollutant range checks on the Silver view after each execution. Any non-zero count aborts the run.
+- Bronze maintenance (`rewrite_data_files`, `expire_snapshots`, `remove_orphan_files`) is executed post-ingest to keep storage tidy.
+- Gold maintenance and Spark staging cleanup run at the end of every pipeline invocation (purges `/user/<user>/.sparkStaging`, prunes `./spark-warehouse`, and trims stale HTTP caches).
+- All Spark entrypoints force `spark.sql.catalogImplementation=in-memory` to avoid local Derby metastore locks when multiple jobs run on the same host.
+- Dependencies pin `numpy==1.26.4` and `pyarrow==14.0.2` to avoid known Arrow/PySpark compatibility issues. Arrow execution is disabled by default (`spark.sql.execution.arrow.pyspark.enabled=false`).
 
-Notes: `ingestion_time` should be recorded in UTC and indicates when the pipeline persisted or processed the record (useful for latency and lineage tracking).
+## Project layout
 
-Partitioning recommendation: partition by date (event_time_local date) and bucket or partition by location_id for efficient province-level queries.
+```
+jobs/ingest/open_meteo_bronze.py   # Bronze ingestion logic (MERGE + housekeeping)
+src/aq_lakehouse/spark_session.py  # Spark builder with Iceberg catalog config
+script/submit_yarn.sh              # Helper to submit arbitrary PySpark jobs to YARN
+scripts/run_pipeline.sh            # One-command pipeline orchestrator (spark-submit + housekeeping)
+scripts/reset_pipeline_state.sh    # Truncate/drop all layers and clear staging/cache files
+docs/ingest_bronze.md              # Detailed operations guide (this README's companion)
+configs/locations.json             # Location IDs and coordinates
+```
 
-Primary/uniqueness key (for merges/upserts): (location_id, event_time_local)
+## Extending the pipeline
 
-## Example configuration
-
-Provide a simple JSON/YAML config that lists coordinates and labels. This config is the single source of truth for locations to ingest.
-
-Example (JSON):
-
-{
-	"timezone": "Asia/Bangkok",   # UTC+7
-	"locations": [
-		{"location_id": "vn_hn_hoankiem", "name": "Hanoi - Hoan Kiem", "lat": 21.0285, "lon": 105.8542},
-		{"location_id": "vn_hcm_district1", "name": "Ho Chi Minh - District 1", "lat": 10.7769, "lon": 106.7006}
-	],
-	"iceberg": {
-		"warehouse_path": "/data/iceberg/aq",
-		"database": "aq_analytics",
-		"table": "hourly_observations"
-	},
-	"api": {
-		"base_url": "https://air-quality-api.open-meteo.com/v1/",
-		"timeout_seconds": 20
-	}
-}
-
-## How the pipeline works (high level)
-
-1. Read the locations config.
-2. For each location, call the Open-Meteo Air Quality API for the requested time range (hourly). Convert/normalize timestamps to UTC+7.
-3. Parse and validate the hourly measurements. Fill missing pollutant values with nulls.
-4. Create a Spark DataFrame with the canonical schema.
-5. Write to an Iceberg table using the Hadoop catalog. Use merge/upsert (or partition overwrite with deduplication) to avoid duplicates.
-
-## Running ETL (manual invocation)
-
-This repo purposely contains no scheduler. To run ingestion for a single day or hour, call the ETL entrypoint script or Spark job directly. Example pseudo-steps:
-
-1. Prepare environment (Spark, Python deps from requirements.txt, Hadoop client config pointing to HDFS).
-2. Run the ingestion script with parameters: start_time, end_time, config path, and target table.
-
-Suggested CLI signature:
-
-python -m jobs.ingest.run --config configs/locations.json --start 2025-09-17T00:00:00Z --end 2025-09-17T23:00:00Z
-
-Or a Spark-submit invocation (PySpark):
-
-spark-submit --master yarn --deploy-mode cluster jobs/ingest/spark_job.py \
-	--config hdfs:///configs/locations.json --start 2025-09-17T00:00:00Z --end 2025-09-17T23:00:00Z
-
-Make sure to set the application timezone conversion to UTC+7 when creating event_time_local.
-
-## AI / Codegen Guidance
-
-This README is written to be precise for AI-driven code generation. When asking an AI to generate code, include these items in the prompt:
-
-- Exact input config shape (show the JSON example above).
-- Exact output schema for the Iceberg table (supply the schema block above).
-- Idempotency requirement: merging/upserting on (location_id, event_time_local).
-- Timezone: Normalize timestamps to UTC+7.
-- Edge cases to handle: missing measurements, partial API responses, API rate limits, network timeouts.
-
-Prompt template (example):
-
-"Generate a PySpark ingestion job that reads a locations JSON, calls the Open-Meteo Air Quality API hourly for each coordinate between start and end timestamps, normalizes timestamps to UTC+7, expands measurements to columns (pm2_5, pm10, no2, so2, o3, co), and writes to an Iceberg table (Hadoop catalog) using upsert semantics on (location_id, event_time_local). Include logging, retries, input validation, and tests for schema correctness."
-
-## Edge cases and failure modes
-
-- API rate limits: implement retries with exponential backoff and backpressure (throttle concurrent API calls).
-- Missing or null pollutant values: store as nulls and optionally emit a data quality warning metric.
-- Duplicate ingestion runs: use merge/upsert semantics or dedupe by key before write.
-- Clock skew and DST: Vietnam uses a fixed UTC+7; no DST changes expected, but always convert from source UTC to UTC+7 reliably.
-
-## Tests and Quality
-
-- Add unit tests for the parsers that transform API JSON into the canonical row format.
-- Add an integration smoke test that runs the pipeline for a single mocked location and a short time range using recorded API responses.
+1. **Add locations** – update `configs/locations.json`. The next pipeline run will merge new coordinates into `dim_locations` automatically.
+2. **Add measures** – include new hourly fields in `HOURLY_VARS` and extend Bronze/Silver/Gold transformations accordingly.
+3. **New Gold metrics** – create another aggregation CTE inside the Gold update block or a separate Iceberg table merged by `RUN_ID`.
+4. **Scheduling** – wrap `scripts/run_pipeline.sh` inside cron, Airflow, or another orchestrator. Non-zero exits provide clear failure signals. Set `EXPIRE_SNAPSHOTS=true` if you want the run to call Iceberg’s snapshot expiration procedure at the end.
+5. **Cold rebuilds** – run `scripts/reset_pipeline_state.sh` before a historical reload to ensure a clean slate (leave HDFS safe mode first if it is active). Snapshot expiration is skipped by default during the reset; enable it via `RESET_EXPIRE_SNAPSHOTS=true` when needed, then start the pipeline with `FULL=true`.
 
 ## Troubleshooting
 
-- HDFS/permissions errors: confirm Hadoop client configs and HDFS user permissions.
-- Iceberg table not found: check the Hadoop catalog warehouse path and ensure metadata files exist under the specified table path.
-- Timezone mismatch: verify the event_time_local column and any downstream dashboards are using UTC+7.
+- **Authentication to HDFS fails**: verify Hadoop configs on the driver and ensure the warehouse path is reachable (`hdfs dfs -ls hdfs://khoa-master:9000/warehouse/iceberg`).
+- **`RUN_ID` missing in orchestrator logs**: ensure stdout is not suppressed; the string is printed on the final line by the ingest job.
+- **`spark-sql` not on PATH**: point `SPARK_SQL` to the desired binary, e.g. `SPARK_SQL=/opt/spark/bin/spark-sql ./scripts/run_pipeline.sh`.
+- **Residual data after a failed run**: execute `./scripts/reset_pipeline_state.sh` to truncate tables, drop views, and clear Spark staging directories before retrying. The reset also removes any local Derby metadata remnants.
+- **Replaying a specific period**: set `MODE=replace-range` along with the appropriate `START`/`END` and (optionally) `LOCATION_IDS`. The Gold layer will automatically resynchronise the affected days.
 
-## Next steps (recommended small additions)
-
-- Provide an example `configs/locations.json` and a small `jobs/ingest/mock_responses/` folder with recorded API responses for tests.
-- Add a small `scripts/run_local_ingest.sh` that sets required env vars and calls the ingestion entrypoint for local development.
-
-## License
-
-This repo does not currently include a license file. Add an appropriate license if you intend to share the code publicly.
-
-
-## Validation (Bronze table)
-
-A small validation job is available to check the Bronze Iceberg table `hadoop_catalog.aq.raw_open_meteo_hourly`.
-
-File: `jobs/ingest/check_bronze.py`
-
-What it does:
-- Verifies the table exists and reads it via the project's Spark session builder
-- Checks schema columns and reports missing/extra columns
-- Computes null rates per column and warns if a column has a very high null rate
-- Detects negative values for numeric pollutant columns
-- Finds duplicate (location_id, ts) groups and reports a small sample
-- Reports per-location min/max timestamps and row counts
-
-Run (example):
-
-```bash
-# from project root
-PYTHONPATH=src spark-submit jobs/ingest/check_bronze.py
-```
-
-Exit codes:
-- 0: all checks passed (no errors)
-- 1: fatal errors (for example, table missing or required columns missing)
-
-The script prints a JSON report to stdout. Use this report for automated monitoring or quick manual inspection.
-
-## Bronze ingest guide
-
-See `docs/ingest_bronze.md` for a complete step-by-step guide to ingesting Open-Meteo air-quality data into the Bronze Iceberg table `hadoop_catalog.aq.raw_open_meteo_hourly`.
-
-Quick examples
-
-1) Check and leave HDFS safe mode (if required):
-
-```bash
-hdfs dfsadmin -safemode get
-hdfs dfsadmin -safemode leave
-```
-
-2) Ingest a date range (example with 10-day chunks):
-
-```bash
-bash script/submit_yarn.sh ingest/open_meteo_bronze.py \
-	--locations configs/locations.json \
-	--start-date 2024-01-01 \
-	--end-date 2024-01-31 \
-	--chunk-days 10
-```
-
-3) Update from latest timestamp in the database to now (auto-backfill if empty):
-
-```bash
-bash script/submit_yarn.sh ingest/open_meteo_bronze.py \
-	--locations configs/locations.json \
-	--update-from-db --yes \
-	--chunk-days 10
-```
-
-The full documentation with SQL checks, CLI options and maintenance notes is available at `docs/ingest_bronze.md`.
-
+For deeper operational steps, consult `docs/ingest_bronze.md`.

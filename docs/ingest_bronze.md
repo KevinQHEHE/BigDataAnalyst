@@ -1,210 +1,189 @@
-Ingesting data into Bronze (open-meteo air quality)
+# Bronze → Silver → Gold Pipeline Guide
 
-This document describes the recommended process to ingest hourly air-quality data from Open-Meteo into the Bronze table `hadoop_catalog.aq.raw_open_meteo_hourly` (Iceberg), including examples, CLI options, SQL checks and maintenance notes.
+This guide explains how the hourly Open-Meteo ingestion job, Iceberg Bronze table, Silver view, and Gold aggregation table fit together. The goal is to offer a single command that is safe to re-run, supports range replacement, and keeps downstream layers in sync automatically.
 
-Prerequisites
-- Spark with Iceberg runtime available on the cluster.
-- HDFS NameNode writable (not in safe mode).
-- `configs/locations.json` present with locations in the format:
-  {
-    "location_name": {"latitude": 21.0, "longitude": 105.8}
-  }
-- `script/submit_yarn.sh` wrapper in the repository root and the job at `jobs/ingest/open_meteo_bronze.py`.
+## 1. One-command pipeline
 
-Disable HDFS safe mode (if necessary)
-Run the following to check and leave safe mode:
+Use `scripts/run_pipeline.sh` to orchestrate the complete flow:
 
 ```bash
-hdfs dfsadmin -safemode get
-hdfs dfsadmin -safemode leave
+START=2024-01-01 END=2024-01-07 ./scripts/run_pipeline.sh
 ```
 
-Spark-submit examples
+The script performs five stages:
 
-1) Ingest specific date range into Bronze
-Fetch locations from `configs/locations.json` for the date range 2024-01-01 -> 2024-01-31, splitting the work into 10-day chunks to avoid API limits:
+1. Submit the Bronze ingest job to YARN via `spark-submit`, capture the emitted `RUN_ID`, and write data via Iceberg `MERGE` so the run is idempotent.
+2. Upsert the `dim_locations` table and refresh the Silver view (`v_silver_air_quality_hourly`).
+3. Refresh the Gold table:
+   - Incremental mode (`FULL=false`): compute impacted `(location_id, date)` pairs from the captured `RUN_ID` and merge them.
+   - Full rebuild (`FULL=true`): truncate and repopulate the Gold table from Silver.
+4. Run data-quality checks (null timestamps, duplicate keys, pollutant range checks). The script exits with a non-zero status if any check fails.
+5. Housekeep Gold Iceberg metadata (compaction + optional snapshot expiration) and delete Spark staging artefacts on HDFS/local disk.
+
+Important environment variables:
+
+- `START` / `END`: inclusive UTC date boundaries (default `2024-01-01` → `2025-09-20`).
+- `MODE`: Bronze write mode (`upsert` or `replace-range`, default `upsert`).
+- `FULL`: `true` triggers a Gold rebuild, otherwise incremental.
+- `LOCATION_IDS`: optional space-delimited list to restrict ingestion/deletion to specific `location_id` values.
+- `LOCATIONS_FILE`: override path to `configs/locations.json`.
+- `CHUNK_DAYS`: adjust API chunk size (default `10`).
+- `EXPIRE_SNAPSHOTS`: set to `true` to enable Iceberg snapshot expiration in the pipeline (defaults to `false` to avoid long-running procedures on constrained clusters).
+
+All Spark interactions are routed to YARN with the Iceberg catalog configured for `hdfs://khoa-master:9000/warehouse/iceberg`. Arrow execution is disabled by default to avoid Python/Arrow compatibility issues and the Hive catalog is forced to `in-memory` to prevent local Derby locks on shared hosts.
+
+The dimension seed set is merged with this form (note the `UNION ALL` pattern to avoid column aliases in `MERGE`):
+
+```sql
+MERGE INTO hadoop_catalog.aq.dim_locations d
+USING (
+  SELECT 'Hà Nội' AS location_id, 21.028511 AS latitude, 105.804817 AS longitude
+  UNION ALL
+  SELECT 'TP. Hồ Chí Minh', 10.762622, 106.660172
+  UNION ALL
+  SELECT 'Đà Nẵng', 16.054406, 108.202167
+) v
+ON d.location_id = v.location_id
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *;
+```
+
+## 2. Bronze ingest job (`jobs/ingest/open_meteo_bronze.py`)
+
+### Table contract
+
+- Namespace/table: `hadoop_catalog.aq.raw_open_meteo_hourly`.
+- Logical key: `(location_id, ts)`.
+- Columns include pollutant metrics, lat/lon, source (`open-meteo`), `run_id`, and `ingested_at`.
+- Table properties set to Iceberg format v2 with 128 MB target file size and hash distribution.
+
+### CLI usage
+
+Always launch the job through Spark/YARN so that distributed resources, HDFS, and Iceberg integrations are honoured:
 
 ```bash
-bash script/submit_yarn.sh ingest/open_meteo_bronze.py \
+bash script/submit_yarn.sh jobs/ingest/open_meteo_bronze.py \
   --locations configs/locations.json \
-  --start-date 2024-01-01 \
-  --end-date 2024-01-31 \
-  --chunk-days 10
+  --start 2024-01-01 \
+  --end   2024-01-07 \
+  --mode upsert
 ```
 
-2) Update from latest date in DB to now (auto-backfill if empty)
-This will compute the start date from `MAX(ts)` in `hadoop_catalog.aq.raw_open_mete_hourly` and fetch from that timestamp until now. If the table is empty, the script will prompt to confirm a backfill from 2023-01-01. Use `--yes` to auto-accept.
+> Tip: running the module with `python3 ...` bypasses Spark/YARN and will fail when the Spark session tries to reach the cluster master. Always use `spark-submit` (or the provided wrapper) in shared environments.
 
-Interactive (will prompt if table empty):
+If you previously ran the script locally, the pipeline will automatically rename the legacy `ingest_ts` column to `ingested_at` the next time it runs to keep the schema consistent.
 
-```bash
-bash script/submit_yarn.sh ingest/open_meteo_bronze.py \
-  --locations configs/locations.json \
-  --update-from-db \
-  --chunk-days 10
-```
+Notable flags:
 
-Non-interactive (auto-accept backfill):
+- `--mode upsert`: default behaviour, performs `MERGE` without prior deletes.
+- `--mode replace-range`: deletes existing rows between `--start` and `--end` for the requested `location_id` values before merging.
+- `--location-id <id>`: repeatable; restricts fetch/deletes to a subset of locations.
+- `--update-from-db`: derive `start`/`end` from the current max timestamp in Bronze. If the table is empty, the script prompts for a backfill from `2023-01-01` (use `--yes` for non-interactive runs).
+- `--chunk-days`: split API calls to respect payload limits.
 
-```bash
-bash script/submit_yarn.sh ingest/open_meteo_bronze.py \
-  --locations configs/locations.json \
-  --update-from-db --yes \
-  --chunk-days 10
-```
+### Runtime behaviour
 
-CLI options (job arguments)
+- Fetches hourly measurements from Open-Meteo using a cached, retried HTTP client.
+- Normalises negative pollutant readings to `NULL` in Bronze while keeping other values raw.
+- Records a unique `run_id` (UUID) and prints `RUN_ID=<value>` to stdout for callers to consume.
+- Executes Iceberg maintenance procedures after each run:
+  - `CALL system.rewrite_data_files`
+  - `CALL system.expire_snapshots(..., -30 days)`
+  - `CALL system.remove_orphan_files`
 
-- `--locations`
-  - Type: path (string)
-  - Required: yes
-  - Description: Path to a JSON file containing locations in the shape `{name: {"latitude": ..., "longitude": ...}}`.
-  - Example: `configs/locations.json`
+## 3. Silver view (`hadoop_catalog.aq.v_silver_air_quality_hourly`)
 
-- `--start-date`
-  - Type: date string `YYYY-MM-DD` (UTC)
-  - Required: not required when `--update-from-db` is used. Otherwise required.
-  - Description: Inclusive start date for fetching data.
-  - Example: `2024-01-01`
-
-- `--end-date`
-  - Type: date string `YYYY-MM-DD` (UTC)
-  - Required: not required when `--update-from-db` is used. Otherwise required.
-  - Description: Inclusive end date for fetching data.
-  - Example: `2024-01-31`
-
-- `--chunk-days`
-  - Type: int
-  - Default: `10`
-  - Description: Split the date range into chunks of at most N days per API call to avoid large payloads.
-
-- `--update-from-db`
-  - Type: flag (boolean)
-  - Default: false
-  - Description: Compute the start date from `MAX(ts)` in the table `hadoop_catalog.aq.raw_open_meteo_hourly` and fetch from that timestamp to now. If the table is empty, the script asks whether to backfill from `2023-01-01`.
-
-- `--yes`
-  - Type: flag (boolean)
-  - Default: false
-  - Description: Automatically accept interactive prompts. Use with `--update-from-db` in non-interactive environments or CI to auto-confirm backfill.
-
-SQL checks for Bronze
-
-Start a spark-sql shell configured with the Iceberg `hadoop_catalog` and the warehouse URI (example uses local mode for quick checks):
-
-```bash
-SPARK_HOME=${SPARK_HOME:-/home/dlhnhom2/spark} \
-$SPARK_HOME/bin/spark-sql --master local[1] \
-  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
-  --conf spark.sql.catalog.hadoop_catalog=org.apache.iceberg.spark.SparkCatalog \
-  --conf spark.sql.catalog.hadoop_catalog.type=hadoop \
-  --conf spark.sql.catalog.hadoop_catalog.warehouse=hdfs://khoa-master:9000/warehouse/iceberg
-```
-
-List tables in the namespace:
+Silver is a view; no data movement is required after Bronze updates. The view applies uniform naming, null handling, and joins coordinates:
 
 ```sql
-SHOW TABLES IN hadoop_catalog.aq;
+CREATE NAMESPACE IF NOT EXISTS spark_catalog.aq;
+
+DROP VIEW IF EXISTS spark_catalog.aq.v_silver_air_quality_hourly;
+
+CREATE VIEW spark_catalog.aq.v_silver_air_quality_hourly AS
+SELECT
+  r.location_id,
+  CAST(r.ts AS TIMESTAMP) AS ts_utc,
+  CAST(to_date(r.ts) AS DATE) AS date,
+  NULLIF(r.aerosol_optical_depth, CASE WHEN r.aerosol_optical_depth < 0 THEN r.aerosol_optical_depth END) AS aod,
+  NULLIF(r.pm2_5, CASE WHEN r.pm2_5 < 0 THEN r.pm2_5 END) AS pm25,
+  NULLIF(r.pm10, CASE WHEN r.pm10 < 0 THEN r.pm10 END) AS pm10,
+  NULLIF(r.nitrogen_dioxide, CASE WHEN r.nitrogen_dioxide < 0 THEN r.nitrogen_dioxide END) AS no2,
+  NULLIF(r.ozone, CASE WHEN r.ozone < 0 THEN r.ozone END) AS o3,
+  NULLIF(r.sulphur_dioxide, CASE WHEN r.sulphur_dioxide < 0 THEN r.sulphur_dioxide END) AS so2,
+  NULLIF(r.carbon_monoxide, CASE WHEN r.carbon_monoxide < 0 THEN r.carbon_monoxide END) AS co,
+  NULLIF(r.uv_index, CASE WHEN r.uv_index < 0 THEN r.uv_index END) AS uv_index,
+  NULLIF(r.uv_index_clear_sky, CASE WHEN r.uv_index_clear_sky < 0 THEN r.uv_index_clear_sky END) AS uv_index_clear_sky,
+  d.latitude AS lat,
+  d.longitude AS lon,
+  r.run_id,
+  r.ingested_at
+FROM hadoop_catalog.aq.raw_open_meteo_hourly r
+LEFT JOIN hadoop_catalog.aq.dim_locations d USING (location_id);
 ```
 
-Count total rows:
+Any Bronze update is instantly visible through the view, removing the need for refresh jobs.
+
+## 4. Gold table (`hadoop_catalog.aq.gold_air_quality_daily`)
+
+- Iceberg table, partitioned by `(date, location_id)`.
+- Columns store daily averages for major pollutants and UV metrics.
+- Incremental refresh uses the Bronze `run_id` to isolate affected days/locations before merging.
+- Full rebuild truncates and recomputes averages from the Silver view (use when Bronze is fully reingested).
+
+## 5. Data quality expectations
+
+The pipeline validates:
+
+- `ts_utc` must be non-null.
+- `(location_id, ts_utc)` pairs must be unique in Silver.
+- `pm25` values must lie in `[0, 2000]` (tunable example check).
+
+Failures terminate the script with an error so orchestrators can alert and retry after intervention.
+
+## 6. Manual SQL toolbox
+
+Run `spark-sql` with the same Iceberg catalog configuration to perform ad-hoc checks.
+
+List history and snapshots:
 
 ```sql
-SELECT COUNT(*) AS total_rows FROM hadoop_catalog.aq.raw_open_meteo_hourly;
+SELECT * FROM hadoop_catalog.aq.raw_open_meteo_hourly.snapshots ORDER BY committed_at DESC;
 ```
 
-Sample rows:
+Inspect Bronze range by location:
 
 ```sql
-SELECT * FROM hadoop_catalog.aq.raw_open_meteo_hourly ORDER BY ts DESC LIMIT 20;
-```
-
-Global time range (min/max):
-
-```sql
-SELECT MIN(ts) AS min_ts, MAX(ts) AS max_ts FROM hadoop_catalog.aq.raw_open_meteo_hourly;
-```
-
-Time range per location:
-
-```sql
-SELECT location_id, MIN(ts) AS min_ts, MAX(ts) AS max_ts
-FROM hadoop_catalog.aq.raw_open_mete_hourly
+SELECT location_id, MIN(ts) AS min_ts, MAX(ts) AS max_ts, COUNT(*) AS rows
+FROM hadoop_catalog.aq.raw_open_meteo_hourly
 GROUP BY location_id
 ORDER BY location_id;
 ```
 
-Record counts per location:
+Delete a specific date range manually (if not using `--mode replace-range`):
 
 ```sql
-SELECT location_id, COUNT(*) AS total_records
-FROM hadoop_catalog.aq.raw_open_meteo_hourly
-GROUP BY location_id
-ORDER BY total_records DESC;
+DELETE FROM hadoop_catalog.aq.raw_open_meteo_hourly
+WHERE location_id IN ('Hà Nội', 'Đà Nẵng')
+  AND ts BETWEEN TIMESTAMP '2024-07-01 00:00:00' AND TIMESTAMP '2024-07-07 23:59:59';
 ```
 
-Find duplicate records by (ts, location_id):
+## 7. Troubleshooting tips
 
-```sql
-WITH dup AS (
-  SELECT ts, location_id, COUNT(*) AS cnt
-  FROM hadoop_catalog.aq.raw_open_meteo_hourly
-  GROUP BY ts, location_id
-  HAVING COUNT(*) > 1
-)
-SELECT t.*
-FROM hadoop_catalog.aq.raw_open_meteo_hourly t
-JOIN dup d ON t.ts = d.ts AND t.location_id = d.location_id
-ORDER BY t.location_id, t.ts;
-```
+- **RUN_ID missing**: ensure no additional `awk` filters are altering ingest output; the job prints `RUN_ID=...` on completion.
+- **Arrow errors**: Python/Arrow mismatches are avoided by pinning `numpy==1.26.4`, `pyarrow==14.0.2` and disabling Arrow (`spark.sql.execution.arrow.pyspark.enabled=false`).
+- **Partial deletes**: when replacing a date range, pass `MODE=replace-range` (or `--mode replace-range`) and provide the same `START`/`END` window used for ingestion.
+- **Gold drift after manual Bronze edits**: rerun `./scripts/run_pipeline.sh` with `FULL=true` to rebuild the Gold table.
+- **Spark staging leftovers**: the pipeline script purges `/user/<user>/.sparkStaging` automatically. If a run is interrupted, you can manually call `hdfs dfs -rm -r -f /user/$USER/.sparkStaging` and rerun the pipeline.
 
-WARNING — delete/reset (only when you mean to re-ingest)
+## 8. Full reset / cleanup
 
-Truncate entire Iceberg table (fast):
-
-```sql
-TRUNCATE TABLE hadoop_catalog.aq.raw_open_meteo_hourly;
-```
-
-Or delete all rows (alternative):
-
-```sql
-DELETE FROM hadoop_catalog.aq.raw_open_meteo_hourly WHERE TRUE;
-```
-
-Cleanup & compacting WSL2 / Docker Desktop VHDX (optional)
-
-1) Remove temporary files on Linux host (example):
+To wipe all data layers and cached artefacts before a full rebuild, run:
 
 ```bash
-sudo rm -rf /tmp/* /var/tmp/* \
-             /var/log/hadoop-yarn/containers/* \
-             /var/hadoop/yarn/local/usercache/*/*
+./scripts/reset_pipeline_state.sh
 ```
 
-2) Create a zero-filled file then remove to free space in WSL2 ext4 image (example):
+The script truncates Bronze, Dim, and Gold tables (when present), drops the Silver view, and clears local/HDFS staging artefacts. Snapshot expiration is disabled by default (set `RESET_EXPIRE_SNAPSHOTS=true` to enable it). The NameNode must be out of safe mode (use `hdfs dfsadmin -safemode leave` if necessary); otherwise the script exits early to keep Spark from failing mid-reset. Afterward, execute `./scripts/run_pipeline.sh` to repopulate the stack from scratch.
 
-```bash
-sudo dd if=/dev/zero of=~/zero.fill bs=1M status=progress || true
-sync
-sudo rm -f ~/zero.fill
-```
-
-3) Shutdown WSL and optimize the VHDX using PowerShell on Windows host:
-
-```powershell
-wsl --shutdown
-Optimize-VHD -Path "E:\Docker\DockerDesktopWSL\main\ext4.vhdx" -Mode Full
-Optimize-VHD -Path "E:\Docker\DockerDesktopWSL\disk\docker_data.vhdx" -Mode Full
-```
-
-Notes and recommendations
-- The job deduplicates by `(location_id, ts)` before writing to Bronze: `df.dropDuplicates(["location_id","ts"])`.
-- The script replaces negative pollutant values with `NULL` to keep Bronze "raw-normalized".
-- The order of `HOURLY_VARS` is important because the Open-Meteo client maps values by index.
-- Set `SPARK_HOME` or `SPARK_SUBMIT` if your environment differs from the defaults in `script/submit_yarn.sh`.
-- Consider adding `--backfill-start` to the job if you want to control the backfill earliest date (currently hard-coded to `2023-01-01`).
-
----
-
-Generated by the repository helper tooling. If you want this file in a different format (README.md, rst) or translated back to Vietnamese, tell me and I'll add it to `docs/`.
+Keeping Bronze as the single source of truth and deriving Silver via a view keeps the system easy to reason about while guaranteeing that reruns, range replacements, and full rebuilds remain safe and predictable.

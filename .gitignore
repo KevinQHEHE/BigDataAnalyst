@@ -217,11 +217,6 @@ zero.fill
 # Windows VHDX images used by Docker Desktop / WSL2
 *.vhdx
 
-# Local Hive/Derby metastore and related runtime files
-metastore_db/
-derby.log
-.cache.sqlite
-
 # Terraform
 .terraform/
 *.tfstate
