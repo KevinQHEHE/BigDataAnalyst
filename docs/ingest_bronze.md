@@ -1,189 +1,373 @@
-# Bronze → Silver → Gold Pipeline Guide
+# Hướng dẫn Ingest dữ liệu vào Bronze Layer
 
-This guide explains how the hourly Open-Meteo ingestion job, Iceberg Bronze table, Silver view, and Gold aggregation table fit together. The goal is to offer a single command that is safe to re-run, supports range replacement, and keeps downstream layers in sync automatically.
+Tài liệu này hướng dẫn chi tiết quy trình ingest dữ liệu chất lượng không khí từ Open-Meteo API vào Bronze layer của data lakehouse.
 
-## 1. One-command pipeline
+## Tổng quan
 
-Use `scripts/run_pipeline.sh` to orchestrate the complete flow:
+Bronze layer là nơi lưu trữ dữ liệu thô (raw data) từ các nguồn bên ngoài. Dữ liệu được lưu trữ trong bảng Iceberg `hadoop_catalog.aq.raw_open_meteo_hourly` với cấu trúc:
+
+```sql
+location_id STRING,           -- Tên địa điểm (key từ locations.json)  
+latitude DOUBLE,             -- Vĩ độ
+longitude DOUBLE,            -- Kinh độ
+ts TIMESTAMP,                -- Timestamp UTC của measurement
+aerosol_optical_depth DOUBLE, -- Độ sâu quang học aerosol
+pm2_5 DOUBLE,               -- PM2.5 concentration (μg/m³)
+pm10 DOUBLE,                -- PM10 concentration (μg/m³)
+dust DOUBLE,                -- Dust concentration (μg/m³)
+nitrogen_dioxide DOUBLE,     -- NO2 concentration (μg/m³)
+ozone DOUBLE,               -- O3 concentration (μg/m³)
+sulphur_dioxide DOUBLE,     -- SO2 concentration (μg/m³)
+carbon_monoxide DOUBLE,     -- CO concentration (mg/m³)
+uv_index DOUBLE,            -- UV Index
+uv_index_clear_sky DOUBLE,  -- UV Index (clear sky)
+source STRING,              -- Nguồn dữ liệu ("open_meteo")
+run_id STRING,              -- UUID của lần chạy ingest
+ingested_at TIMESTAMP       -- Timestamp khi data được ingest
+```
+
+## Chuẩn bị môi trường
+
+### 1. Kiểm tra Safe Mode của HDFS
+Trước khi ingest, cần đảm bảo HDFS không ở safe mode:
 
 ```bash
-START=2024-01-01 END=2024-01-07 ./scripts/run_pipeline.sh
+# Kiểm tra trạng thái safe mode
+hdfs dfsadmin -safemode get
+
+# Nếu safe mode đang ON, tắt safe mode
+hdfs dfsadmin -safemode leave
 ```
 
-The script performs five stages:
-
-1. Submit the Bronze ingest job to YARN via `spark-submit`, capture the emitted `RUN_ID`, and write data via Iceberg `MERGE` so the run is idempotent.
-2. Upsert the `dim_locations` table and refresh the Silver view (`v_silver_air_quality_hourly`).
-3. Refresh the Gold table:
-   - Incremental mode (`FULL=false`): compute impacted `(location_id, date)` pairs from the captured `RUN_ID` and merge them.
-   - Full rebuild (`FULL=true`): truncate and repopulate the Gold table from Silver.
-4. Run data-quality checks (null timestamps, duplicate keys, pollutant range checks). The script exits with a non-zero status if any check fails.
-5. Housekeep Gold Iceberg metadata (compaction + optional snapshot expiration) and delete Spark staging artefacts on HDFS/local disk.
-
-Important environment variables:
-
-- `START` / `END`: inclusive UTC date boundaries (default `2024-01-01` → `2025-09-20`).
-- `MODE`: Bronze write mode (`upsert` or `replace-range`, default `upsert`).
-- `FULL`: `true` triggers a Gold rebuild, otherwise incremental.
-- `LOCATION_IDS`: optional space-delimited list to restrict ingestion/deletion to specific `location_id` values.
-- `LOCATIONS_FILE`: override path to `configs/locations.json`.
-- `CHUNK_DAYS`: adjust API chunk size (default `10`).
-- `EXPIRE_SNAPSHOTS`: set to `true` to enable Iceberg snapshot expiration in the pipeline (defaults to `false` to avoid long-running procedures on constrained clusters).
-
-All Spark interactions are routed to YARN with the Iceberg catalog configured for `hdfs://khoa-master:9000/warehouse/iceberg`. Arrow execution is disabled by default to avoid Python/Arrow compatibility issues and the Hive catalog is forced to `in-memory` to prevent local Derby locks on shared hosts.
-
-The dimension seed set is merged with this form (note the `UNION ALL` pattern to avoid column aliases in `MERGE`):
-
-```sql
-MERGE INTO hadoop_catalog.aq.dim_locations d
-USING (
-  SELECT 'Hà Nội' AS location_id, 21.028511 AS latitude, 105.804817 AS longitude
-  UNION ALL
-  SELECT 'TP. Hồ Chí Minh', 10.762622, 106.660172
-  UNION ALL
-  SELECT 'Đà Nẵng', 16.054406, 108.202167
-) v
-ON d.location_id = v.location_id
-WHEN MATCHED THEN UPDATE SET *
-WHEN NOT MATCHED THEN INSERT *;
-```
-
-## 2. Bronze ingest job (`jobs/ingest/open_meteo_bronze.py`)
-
-### Table contract
-
-- Namespace/table: `hadoop_catalog.aq.raw_open_meteo_hourly`.
-- Logical key: `(location_id, ts)`.
-- Columns include pollutant metrics, lat/lon, source (`open-meteo`), `run_id`, and `ingested_at`.
-- Table properties set to Iceberg format v2 with 128 MB target file size and hash distribution.
-
-### CLI usage
-
-Always launch the job through Spark/YARN so that distributed resources, HDFS, and Iceberg integrations are honoured:
+### 2. Cấu hình môi trường
+Đảm bảo các biến môi trường được thiết lập:
 
 ```bash
-bash script/submit_yarn.sh jobs/ingest/open_meteo_bronze.py \
-  --locations configs/locations.json \
-  --start 2024-01-01 \
-  --end   2024-01-07 \
-  --mode upsert
+# Spark Home (nếu cần)
+export SPARK_HOME=${SPARK_HOME:-/home/dlhnhom2/spark}
+
+# Warehouse URI (tùy chọn, mặc định là hdfs://khoa-master:9000/warehouse/iceberg)
+export WAREHOUSE_URI=hdfs://khoa-master:9000/warehouse/iceberg
 ```
 
-> Tip: running the module with `python3 ...` bypasses Spark/YARN and will fail when the Spark session tries to reach the cluster master. Always use `spark-submit` (or the provided wrapper) in shared environments.
+## Các tham số CLI
 
-If you previously ran the script locally, the pipeline will automatically rename the legacy `ingest_ts` column to `ingested_at` the next time it runs to keep the schema consistent.
+### Tham số bắt buộc
 
-Notable flags:
+#### `--locations`
+- **Type**: String (đường dẫn file)  
+- **Required**: Có
+- **Mô tả**: Đường dẫn tới file JSON chứa các địa điểm dưới dạng `{name: {"latitude": ..., "longitude": ...}}`
+- **Ví dụ**: `configs/locations.json`
 
-- `--mode upsert`: default behaviour, performs `MERGE` without prior deletes.
-- `--mode replace-range`: deletes existing rows between `--start` and `--end` for the requested `location_id` values before merging.
-- `--location-id <id>`: repeatable; restricts fetch/deletes to a subset of locations.
-- `--update-from-db`: derive `start`/`end` from the current max timestamp in Bronze. If the table is empty, the script prompts for a backfill from `2023-01-01` (use `--yes` for non-interactive runs).
-- `--chunk-days`: split API calls to respect payload limits.
+### Tham số thời gian
 
-### Runtime behaviour
+#### `--start-date` / `--start`
+- **Type**: Date string (YYYY-MM-DD, UTC)
+- **Required**: Bắt buộc nếu không dùng `--update-from-db`
+- **Mô tả**: Ngày bắt đầu fetch dữ liệu (bao gồm)
+- **Ví dụ**: `2024-01-01`
 
-- Fetches hourly measurements from Open-Meteo using a cached, retried HTTP client.
-- Normalises negative pollutant readings to `NULL` in Bronze while keeping other values raw.
-- Records a unique `run_id` (UUID) and prints `RUN_ID=<value>` to stdout for callers to consume.
-- Executes Iceberg maintenance procedures after each run:
-  - `CALL system.rewrite_data_files`
-  - `CALL system.expire_snapshots(..., -30 days)`
-  - `CALL system.remove_orphan_files`
+#### `--end-date` / `--end`  
+- **Type**: Date string (YYYY-MM-DD, UTC)
+- **Required**: Bắt buộc nếu không dùng `--update-from-db`
+- **Mô tả**: Ngày kết thúc fetch dữ liệu (bao gồm)  
+- **Ví dụ**: `2024-01-31`
 
-## 3. Silver view (`hadoop_catalog.aq.v_silver_air_quality_hourly`)
+### Tham số tùy chọn
 
-Silver is a view; no data movement is required after Bronze updates. The view applies uniform naming, null handling, and joins coordinates:
+#### `--chunk-days`
+- **Type**: Integer
+- **Default**: 10
+- **Mô tả**: Chia range thành các chunk có độ dài ≤ N ngày cho mỗi lần gọi API (giảm kích thước payload và tránh timeout)
 
-```sql
-CREATE NAMESPACE IF NOT EXISTS spark_catalog.aq;
+#### `--update-from-db`
+- **Type**: Flag (boolean)
+- **Default**: false
+- **Mô tả**: Tự động tính `start_date` dựa trên `MAX(ts)` trong bảng Bronze và fetch từ thời điểm đó đến hiện tại. Nếu bảng rỗng, sẽ hỏi có backfill từ 2023-01-01 hay không.
 
-DROP VIEW IF EXISTS spark_catalog.aq.v_silver_air_quality_hourly;
+#### `--yes`
+- **Type**: Flag (boolean)  
+- **Default**: false
+- **Mô tả**: Tự động đồng ý các prompt (dùng cho môi trường non-interactive/CI). Khi dùng cùng `--update-from-db`, nếu bảng trống sẽ tự động backfill từ 2023-01-01 đến hiện tại.
 
-CREATE VIEW spark_catalog.aq.v_silver_air_quality_hourly AS
-SELECT
-  r.location_id,
-  CAST(r.ts AS TIMESTAMP) AS ts_utc,
-  CAST(to_date(r.ts) AS DATE) AS date,
-  NULLIF(r.aerosol_optical_depth, CASE WHEN r.aerosol_optical_depth < 0 THEN r.aerosol_optical_depth END) AS aod,
-  NULLIF(r.pm2_5, CASE WHEN r.pm2_5 < 0 THEN r.pm2_5 END) AS pm25,
-  NULLIF(r.pm10, CASE WHEN r.pm10 < 0 THEN r.pm10 END) AS pm10,
-  NULLIF(r.nitrogen_dioxide, CASE WHEN r.nitrogen_dioxide < 0 THEN r.nitrogen_dioxide END) AS no2,
-  NULLIF(r.ozone, CASE WHEN r.ozone < 0 THEN r.ozone END) AS o3,
-  NULLIF(r.sulphur_dioxide, CASE WHEN r.sulphur_dioxide < 0 THEN r.sulphur_dioxide END) AS so2,
-  NULLIF(r.carbon_monoxide, CASE WHEN r.carbon_monoxide < 0 THEN r.carbon_monoxide END) AS co,
-  NULLIF(r.uv_index, CASE WHEN r.uv_index < 0 THEN r.uv_index END) AS uv_index,
-  NULLIF(r.uv_index_clear_sky, CASE WHEN r.uv_index_clear_sky < 0 THEN r.uv_index_clear_sky END) AS uv_index_clear_sky,
-  d.latitude AS lat,
-  d.longitude AS lon,
-  r.run_id,
-  r.ingested_at
-FROM hadoop_catalog.aq.raw_open_meteo_hourly r
-LEFT JOIN hadoop_catalog.aq.dim_locations d USING (location_id);
+#### `--mode`
+- **Type**: Choice ["upsert", "replace-range"]
+- **Default**: "upsert"
+- **Mô tả**: 
+  - `upsert`: Merge dữ liệu mới vào bảng (update nếu trùng key)
+  - `replace-range`: Xóa dữ liệu trong range trước khi insert
+
+#### `--location-id`
+- **Type**: String (có thể dùng nhiều lần)
+- **Default**: [] (tất cả locations)
+- **Mô tả**: Giới hạn ingest chỉ một hoặc một số location_id cụ thể
+- **Ví dụ**: `--location-id "Hà Nội" --location-id "TP. Hồ Chí Minh"`
+
+## Các tình huống sử dụng
+
+### 1. Ingest dữ liệu cho range thời gian cụ thể
+
+```bash
+# Ingest dữ liệu từ 2024-01-01 đến 2024-01-31, chia chunk 10 ngày
+bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
+    --locations configs/locations.json \
+    --start-date 2024-01-01 \
+    --end-date 2024-01-31 \
+    --chunk-days 10
 ```
 
-Any Bronze update is instantly visible through the view, removing the need for refresh jobs.
+### 2. Update incremental từ database
 
-## 4. Gold table (`hadoop_catalog.aq.gold_air_quality_daily`)
-
-- Iceberg table, partitioned by `(date, location_id)`.
-- Columns store daily averages for major pollutants and UV metrics.
-- Incremental refresh uses the Bronze `run_id` to isolate affected days/locations before merging.
-- Full rebuild truncates and recomputes averages from the Silver view (use when Bronze is fully reingested).
-
-## 5. Data quality expectations
-
-The pipeline validates:
-
-- `ts_utc` must be non-null.
-- `(location_id, ts_utc)` pairs must be unique in Silver.
-- `pm25` values must lie in `[0, 2000]` (tunable example check).
-
-Failures terminate the script with an error so orchestrators can alert and retry after intervention.
-
-## 6. Manual SQL toolbox
-
-Run `spark-sql` with the same Iceberg catalog configuration to perform ad-hoc checks.
-
-List history and snapshots:
-
-```sql
-SELECT * FROM hadoop_catalog.aq.raw_open_meteo_hourly.snapshots ORDER BY committed_at DESC;
+```bash
+# Update từ thời điểm mới nhất trong DB đến hiện tại
+# Nếu DB trống, sẽ hỏi có muốn backfill từ 2023-01-01 không
+bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
+    --locations configs/locations.json \
+    --update-from-db \
+    --chunk-days 10
 ```
 
-Inspect Bronze range by location:
+### 3. Backfill tự động (non-interactive)
+
+```bash
+# Backfill tự động từ 2023-01-01 nếu DB trống, hoặc update từ MAX(ts)
+bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
+    --locations configs/locations.json \
+    --update-from-db \
+    --yes \
+    --chunk-days 10
+```
+
+### 4. Ingest chỉ một số địa điểm cụ thể
+
+```bash
+# Chỉ ingest dữ liệu cho Hà Nội và TP.HCM
+bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
+    --locations configs/locations.json \
+    --start-date 2024-01-01 \
+    --end-date 2024-01-31 \
+    --location-id "Hà Nội" \
+    --location-id "TP. Hồ Chí Minh"
+```
+
+### 5. Replace range (ingest lại dữ liệu)
+
+```bash
+# Xóa và ingest lại dữ liệu trong range
+bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
+    --locations configs/locations.json \
+    --start-date 2024-01-01 \
+    --end-date 2024-01-07 \
+    --mode replace-range
+```
+
+## Kiểm tra dữ liệu trong Bronze
+
+### 1. Kết nối Spark SQL
+
+```bash
+SPARK_HOME=${SPARK_HOME:-/home/dlhnhom2/spark} \
+$SPARK_HOME/bin/spark-sql --master local[1] \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  --conf spark.sql.catalog.hadoop_catalog=org.apache.iceberg.spark.SparkCatalog \
+  --conf spark.sql.catalog.hadoop_catalog.type=hadoop \
+  --conf spark.sql.catalog.hadoop_catalog.warehouse=hdfs://khoa-master:9000/warehouse/iceberg
+```
+
+### 2. Kiểm tra tables
 
 ```sql
-SELECT location_id, MIN(ts) AS min_ts, MAX(ts) AS max_ts, COUNT(*) AS rows
+-- Xem các bảng trong namespace aq
+SHOW TABLES IN hadoop_catalog.aq;
+```
+
+### 3. Kiểm tra tổng quan dữ liệu
+
+```sql
+-- Đếm tổng số rows
+SELECT COUNT(*) AS total_rows FROM hadoop_catalog.aq.raw_open_meteo_hourly;
+
+-- Lấy sample dữ liệu mới nhất
+SELECT * FROM hadoop_catalog.aq.raw_open_meteo_hourly 
+ORDER BY ts DESC LIMIT 20;
+
+-- Kiểm tra time range tổng thể
+SELECT MIN(ts) AS min_ts, MAX(ts) AS max_ts 
+FROM hadoop_catalog.aq.raw_open_meteo_hourly;
+```
+
+### 4. Phân tích dữ liệu theo địa điểm
+
+```sql
+-- Số lượng records theo địa điểm
+SELECT location_id, COUNT(*) AS total_records
+FROM hadoop_catalog.aq.raw_open_meteo_hourly
+GROUP BY location_id
+ORDER BY total_records DESC;
+
+-- Time range theo từng địa điểm  
+SELECT location_id, MIN(ts) AS min_ts, MAX(ts) AS max_ts
 FROM hadoop_catalog.aq.raw_open_meteo_hourly
 GROUP BY location_id
 ORDER BY location_id;
 ```
 
-Delete a specific date range manually (if not using `--mode replace-range`):
+### 5. Kiểm tra data quality
 
 ```sql
-DELETE FROM hadoop_catalog.aq.raw_open_meteo_hourly
-WHERE location_id IN ('Hà Nội', 'Đà Nẵng')
-  AND ts BETWEEN TIMESTAMP '2024-07-01 00:00:00' AND TIMESTAMP '2024-07-07 23:59:59';
+-- Tìm duplicates theo (ts, location_id)
+WITH dup AS (
+  SELECT ts, location_id, COUNT(*) AS cnt
+  FROM hadoop_catalog.aq.raw_open_meteo_hourly
+  GROUP BY ts, location_id
+  HAVING COUNT(*) > 1
+)
+SELECT t.*
+FROM hadoop_catalog.aq.raw_open_meteo_hourly t
+JOIN dup d ON t.ts = d.ts AND t.location_id = d.location_id
+ORDER BY t.location_id, t.ts;
+
+-- Kiểm tra null values
+SELECT 
+  COUNT(*) AS total_rows,
+  COUNT(pm2_5) AS pm2_5_non_null,
+  COUNT(pm10) AS pm10_non_null,
+  COUNT(nitrogen_dioxide) AS no2_non_null,
+  COUNT(ozone) AS o3_non_null
+FROM hadoop_catalog.aq.raw_open_meteo_hourly;
 ```
 
-## 7. Troubleshooting tips
+## Xử lý dữ liệu và maintenance
 
-- **RUN_ID missing**: ensure no additional `awk` filters are altering ingest output; the job prints `RUN_ID=...` on completion.
-- **Arrow errors**: Python/Arrow mismatches are avoided by pinning `numpy==1.26.4`, `pyarrow==14.0.2` and disabling Arrow (`spark.sql.execution.arrow.pyspark.enabled=false`).
-- **Partial deletes**: when replacing a date range, pass `MODE=replace-range` (or `--mode replace-range`) and provide the same `START`/`END` window used for ingestion.
-- **Gold drift after manual Bronze edits**: rerun `./scripts/run_pipeline.sh` with `FULL=true` to rebuild the Gold table.
-- **Spark staging leftovers**: the pipeline script purges `/user/<user>/.sparkStaging` automatically. If a run is interrupted, you can manually call `hdfs dfs -rm -r -f /user/$USER/.sparkStaging` and rerun the pipeline.
+### 1. Xóa dữ liệu (khi cần ingest lại)
 
-## 8. Full reset / cleanup
+```sql
+-- ⚠️ CHỈ THỰC HIỆN KHI MUỐN INGEST LẠI DATA
+-- Truncate toàn bộ bảng
+TRUNCATE TABLE hadoop_catalog.aq.raw_open_meteo_hourly;
 
-To wipe all data layers and cached artefacts before a full rebuild, run:
+-- Hoặc xóa theo điều kiện
+DELETE FROM hadoop_catalog.aq.raw_open_meteo_hourly 
+WHERE ts >= '2024-01-01' AND ts <= '2024-01-31';
+```
+
+### 2. Iceberg maintenance
+
+Các thao tác maintenance được tự động chạy sau mỗi lần ingest:
+
+```sql
+-- Rewrite data files để tối ưu kích thước
+CALL hadoop_catalog.system.rewrite_data_files(
+  'aq.raw_open_meteo_hourly',
+  map('target-file-size-bytes', CAST(134217728 AS bigint))
+);
+
+-- Expire old snapshots (giữ 30 ngày gần nhất)
+CALL hadoop_catalog.system.expire_snapshots(
+  'aq.raw_open_meteo_hourly',
+  CURRENT_TIMESTAMP - INTERVAL 30 DAYS
+);
+
+-- Xóa orphan files
+CALL hadoop_catalog.system.remove_orphan_files('aq.raw_open_meteo_hourly');
+```
+
+## Troubleshooting
+
+### Lỗi thường gặp
+
+#### 1. Safe Mode Error
+```
+ERROR: Name node is in safe mode
+```
+**Giải pháp**: Tắt safe mode như hướng dẫn ở phần chuẩn bị.
+
+#### 2. HDFS Connection Error
+```
+ERROR: Failed to connect to hdfs://khoa-master:9000
+```
+**Giải pháp**: Kiểm tra kết nối mạng và cấu hình Hadoop client.
+
+#### 3. API Rate Limiting
+```
+ERROR: Too many requests to Open-Meteo API
+```
+**Giải pháp**: Tăng `--chunk-days` để giảm số lần gọi API, hoặc chờ và thử lại.
+
+#### 4. Memory Error khi ingest large range
+**Giải pháp**: 
+- Giảm `--chunk-days` xuống 5 hoặc 7
+- Chia nhỏ range thời gian thành nhiều lần chạy
+
+#### 5. Duplicate Key Error
+```
+ERROR: Duplicate key violations during MERGE
+```
+**Giải pháp**: Sử dụng `--mode replace-range` để xóa và ingest lại.
+
+### Logs và debugging
+
+- Job logs được lưu trong YARN: `yarn logs -applicationId <app_id>`
+- Local cache của API requests: `.cache/` directory  
+- Spark staging: `/user/<username>/.sparkStaging/`
+
+### Recovery procedures
+
+#### Khôi phục từ failed run:
+1. Kiểm tra logs để xác định nguyên nhân
+2. Sử dụng `--mode replace-range` để ingest lại range bị lỗi
+3. Chạy data quality checks sau khi ingest thành công
+
+#### Cleanup môi trường:
+```bash
+# Xóa Spark staging files
+hdfs dfs -rm -r /user/$USER/.sparkStaging/*
+
+# Xóa local cache
+rm -rf .cache/
+
+# Xóa local spark warehouse
+rm -rf spark-warehouse/
+```
+
+## Performance tuning
+
+### Tối ưu hóa ingest
+- **chunk-days**: 7-14 ngày cho historical data, 1-3 ngày cho incremental
+- **Concurrent locations**: Script chạy tuần tự theo location để tránh overload API
+- **Caching**: HTTP requests được cache 1 giờ để tránh duplicate calls
+
+### Tối ưu hóa Iceberg
+- **Partitioning**: Bảng được partition theo `days(ts)` 
+- **File size**: Target 128MB per file
+- **Compaction**: Tự động chạy sau mỗi ingest
+
+## Quy trình dọn dẹp hệ thống (WSL2/Docker Desktop)
+
+Khi cần thu hồi disk space sau khi xử lý large datasets:
 
 ```bash
-./scripts/reset_pipeline_state.sh
+# 1. Xóa temp files và logs
+sudo rm -rf /tmp/* /var/tmp/* \
+             /var/log/hadoop-yarn/containers/* \
+             /var/hadoop/yarn/local/usercache/*/*
+
+# 2. Trim filesystem
+sudo fstrim -av
+sudo dd if=/dev/zero of=~/zero.fill bs=4M iflag=fullblock oflag=direct status=progress
+
+# 3. Sync và cleanup
+sync
+sudo rm -f ~/zero.fill
 ```
 
-The script truncates Bronze, Dim, and Gold tables (when present), drops the Silver view, and clears local/HDFS staging artefacts. Snapshot expiration is disabled by default (set `RESET_EXPIRE_SNAPSHOTS=true` to enable it). The NameNode must be out of safe mode (use `hdfs dfsadmin -safemode leave` if necessary); otherwise the script exits early to keep Spark from failing mid-reset. Afterward, execute `./scripts/run_pipeline.sh` to repopulate the stack from scratch.
+Sau đó shutdown WSL và optimize VHDX files:
+```powershell
+# Trong PowerShell (Windows)
+wsl --shutdown
 
-Keeping Bronze as the single source of truth and deriving Silver via a view keeps the system easy to reason about while guaranteeing that reruns, range replacements, and full rebuilds remain safe and predictable.
+# Optimize Docker Desktop VHDX files
+Optimize-VHD -Path "E:\Docker\DockerDesktopWSL\main\ext4.vhdx" -Mode Full
+Optimize-VHD -Path "E:\Docker\DockerDesktopWSL\disk\docker_data.vhdx" -Mode Full
+```

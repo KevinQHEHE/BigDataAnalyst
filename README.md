@@ -1,31 +1,257 @@
-# AQ Lakehouse — Vietnam Air Quality Pipeline
+# AQ Lakehouse — Vietnam Air Quality Data Pipeline
 
-A modular lakehouse pipeline that ingests hourly air-quality measurements from the Open-Meteo API, stores them in an Iceberg-backed Bronze table, derives a Silver view for clean analytics, and maintains a daily Gold table for BI dashboards. The flow is idempotent, supports range replacement, and can rebuild downstream layers automatically.
+Pipeline thu thập dữ liệu chất lượng không khí theo giờ từ Open-Meteo API, lưu trữ trong bảng Bronze layer dựa trên Iceberg, và hỗ trợ quản lý dữ liệu với các tính năng idempotent và range replacement.
 
-## Architecture at a glance
+## Kiến trúc hệ thống
 
-- **Bronze (`hadoop_catalog.aq.raw_open_meteo_hourly`)** – Source-of-truth Iceberg table keyed by `(location_id, ts)`. Data is written via `MERGE` with per-run UUIDs and timestamps for lineage.
-- **Dim (`hadoop_catalog.aq.dim_locations`)** – Type 1 dimension carrying the authoritative latitude/longitude for each location.
-- **Silver (`spark_catalog.aq.v_silver_air_quality_hourly`)** – A view that cleans negative readings, keeps timestamps in UTC, and enriches with coordinates (backed by the session catalog while sourcing data from Iceberg Bronze).
-- **Gold (`hadoop_catalog.aq.gold_air_quality_daily`)** – Iceberg table storing per-day pollutant averages. Only affected `(location_id, date)` pairs are updated per run.
-- **Orchestration (`scripts/run_pipeline.sh`)** – Single command to run ingest → housekeeping → dimension/view refresh → incremental/full Gold update → data-quality checks → staging cleanup.
-- **Reset (`scripts/reset_pipeline_state.sh`)** – Optional utility to truncate/drop downstream artefacts and clear staging/cache files before a fresh rebuild.
+### Data Layer
+- **Bronze Layer** (`hadoop_catalog.aq.raw_open_meteo_hourly`) – Bảng Iceberg lưu trữ dữ liệu thô từ Open-Meteo API, với key là `(location_id, ts)`. Dữ liệu được ghi thông qua `MERGE` operation với UUID và timestamp để truy xuất lineage.
 
-## Quick start
+### Các thành phần chính
+- **Ingest Job** (`jobs/ingest/open_meteo_bronze.py`) – Thu thập dữ liệu từ API và ghi vào Bronze
+- **Spark Session Builder** (`src/aq_lakehouse/spark_session.py`) – Cấu hình Spark với Iceberg catalogs
+- **Submit Script** (`scripts/submit_yarn.sh`) – Helper script để submit PySpark jobs lên YARN
+- **Location Config** (`configs/locations.json`) – Định nghĩa các địa điểm và tọa độ
 
-1. Install dependencies (Python 3.10+ recommended):
-   ```bash
-   pip install -r requirements.txt
-   ```
-2. Make sure Spark and Hadoop clients can access `hdfs://khoa-master:9000/` and Iceberg extensions are available on the cluster.
-3. Run the full pipeline (submits Spark jobs to YARN):
-   ```bash
-   START=2024-01-01 END=2024-01-31 ./scripts/run_pipeline.sh
-   ```
-4. For a Gold rebuild after reloading Bronze entirely:
-   ```bash
-   START=2023-01-01 END=2025-12-31 FULL=true ./scripts/run_pipeline.sh
-   ```
+## Cài đặt nhanh
+
+### 1. Cài đặt dependencies
+Yêu cầu Python 3.10+:
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Kiểm tra môi trường
+Đảm bảo Spark và Hadoop clients có thể truy cập `hdfs://khoa-master:9000/` và các Iceberg extensions khả dụng trên cluster:
+
+```bash
+# Kiểm tra HDFS connection
+hdfs dfs -ls hdfs://khoa-master:9000/
+
+# Tắt safe mode nếu cần
+hdfs dfsadmin -safemode leave
+```
+
+### 3. Chạy ingest đơn giản
+```bash
+# Ingest dữ liệu từ 2024-01-01 đến 2024-01-31
+bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
+    --locations configs/locations.json \
+    --start-date 2024-01-01 \
+    --end-date 2024-01-31 \
+    --chunk-days 10
+```
+
+### 4. Update incremental từ database hiện tại
+```bash
+# Tự động detect từ MAX(ts) và update đến hiện tại
+bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
+    --locations configs/locations.json \
+    --update-from-db \
+    --yes \
+    --chunk-days 10
+```
+
+## Environment Variables
+
+### Các biến môi trường chính
+- `SPARK_HOME` — Đường dẫn đến Spark installation (mặc định: `/home/dlhnhom2/spark`)
+- `WAREHOUSE_URI` — URI của Iceberg warehouse (mặc định: `hdfs://khoa-master:9000/warehouse/iceberg`)
+- `SPARK_SUBMIT` — Đường dẫn custom đến spark-submit binary (tùy chọn)
+
+## Chi tiết Ingest Job
+
+### Data Schema
+Bảng Bronze lưu trữ các trường sau:
+```sql
+location_id STRING,           -- Tên địa điểm từ locations.json
+latitude DOUBLE,             -- Vĩ độ  
+longitude DOUBLE,            -- Kinh độ
+ts TIMESTAMP,                -- Timestamp UTC
+aerosol_optical_depth DOUBLE, -- Độ sâu quang học aerosol  
+pm2_5 DOUBLE,               -- PM2.5 (μg/m³)
+pm10 DOUBLE,                -- PM10 (μg/m³)
+dust DOUBLE,                -- Dust (μg/m³)
+nitrogen_dioxide DOUBLE,     -- NO2 (μg/m³)
+ozone DOUBLE,               -- O3 (μg/m³)
+sulphur_dioxide DOUBLE,     -- SO2 (μg/m³)
+carbon_monoxide DOUBLE,     -- CO (mg/m³)
+uv_index DOUBLE,            -- UV Index
+uv_index_clear_sky DOUBLE,  -- UV Index clear sky
+source STRING,              -- "open_meteo"
+run_id STRING,              -- UUID của run
+ingested_at TIMESTAMP       -- Thời gian ingest
+```
+
+### Tính năng chính
+- **HTTP Caching**: Cached session với 1-hour expiry để tránh duplicate API calls
+- **Retry Logic**: 5 lần retry với exponential backoff
+- **Data Sanitization**: Chuyển đổi negative readings thành `NULL`
+- **Deduplication**: Loại bỏ duplicate `(location_id, ts)` trong cùng batch
+- **Idempotent Writes**: Sử dụng Iceberg `MERGE` để update thay vì duplicate
+- **Range Replacement**: Support xóa và ingest lại data cho range cụ thể
+- **Auto Maintenance**: Tự động chạy compaction và cleanup sau mỗi ingest
+
+### Các chế độ ingest
+- **Upsert** (mặc định): Merge data mới, update nếu trùng key
+- **Replace Range**: Xóa data trong range trước khi insert
+
+## Cấu trúc dữ liệu
+
+| Component | Schema | Partitioning | Đặc điểm |
+|-----------|--------|-------------|----------|
+| Bronze | Hourly measurements với metadata | `days(ts)` | Iceberg Format v2, hash distribution, target file size 128MB |
+
+## Data Quality & Maintenance
+
+### Tự động maintenance sau mỗi ingest
+- **File Compaction**: `rewrite_data_files` để tối ưu file sizes
+- **Snapshot Cleanup**: `expire_snapshots` giữ lại 30 ngày gần nhất  
+- **Orphan Cleanup**: `remove_orphan_files` xóa files không sử dụng
+
+### Spark configuration
+- Force `spark.sql.catalogImplementation=in-memory` để tránh Derby metastore locks
+- Disable Arrow execution (`spark.sql.execution.arrow.pyspark.enabled=false`)
+- Pin dependencies: `numpy==1.26.4`, `pyarrow==14.0.2` để tránh compatibility issues
+
+## Cấu trúc project
+
+```
+configs/locations.json              # Danh sách địa điểm và tọa độ
+jobs/ingest/open_meteo_bronze.py   # Logic ingest Bronze (MERGE + maintenance)
+src/aq_lakehouse/spark_session.py # Spark session builder với Iceberg config  
+scripts/submit_yarn.sh             # Helper submit PySpark jobs to YARN
+docs/ingest_bronze.md              # Hướng dẫn chi tiết ingest Bronze
+requirements.txt                   # Python dependencies
+```
+
+## Sử dụng nâng cao
+
+### 1. Ingest specific locations
+```bash
+bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
+    --locations configs/locations.json \
+    --start-date 2024-01-01 \
+    --end-date 2024-01-31 \
+    --location-id "Hà Nội" \
+    --location-id "TP. Hồ Chí Minh"
+```
+
+### 2. Replace range (ingest lại data)
+```bash
+bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
+    --locations configs/locations.json \
+    --start-date 2024-01-01 \
+    --end-date 2024-01-07 \
+    --mode replace-range
+```
+
+### 3. Kiểm tra dữ liệu với Spark SQL
+```bash
+# Kết nối Spark SQL
+SPARK_HOME=${SPARK_HOME:-/home/dlhnhom2/spark} \
+$SPARK_HOME/bin/spark-sql --master local[1] \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  --conf spark.sql.catalog.hadoop_catalog=org.apache.iceberg.spark.SparkCatalog \
+  --conf spark.sql.catalog.hadoop_catalog.type=hadoop \
+  --conf spark.sql.catalog.hadoop_catalog.warehouse=hdfs://khoa-master:9000/warehouse/iceberg
+```
+
+Queries phổ biến:
+```sql
+-- Kiểm tra tổng quan
+SELECT COUNT(*) FROM hadoop_catalog.aq.raw_open_meteo_hourly;
+
+-- Time range
+SELECT MIN(ts) AS min_ts, MAX(ts) AS max_ts 
+FROM hadoop_catalog.aq.raw_open_meteo_hourly;
+
+-- Phân bố theo địa điểm
+SELECT location_id, COUNT(*) AS records
+FROM hadoop_catalog.aq.raw_open_meteo_hourly
+GROUP BY location_id ORDER BY records DESC;
+```
+
+## Mở rộng pipeline
+
+### 1. Thêm địa điểm mới
+Cập nhật `configs/locations.json`:
+```json
+{
+    "Hà Nội": { "latitude": 21.028511, "longitude": 105.804817 },
+    "TP. Hồ Chí Minh": { "latitude": 10.762622, "longitude": 106.660172 },
+    "Đà Nẵng": { "latitude": 16.054406, "longitude": 108.202167 },
+    "Cần Thơ": { "latitude": 10.045, "longitude": 105.747 }
+}
+```
+
+### 2. Thêm measurements mới
+Cập nhật `HOURLY_VARS` trong `jobs/ingest/open_meteo_bronze.py` và schema của bảng Bronze.
+
+### 3. Scheduling
+Wrap `scripts/submit_yarn.sh` trong cron hoặc Airflow:
+```bash
+# Cron example: chạy hàng giờ
+0 * * * * cd /path/to/dlh-aqi && bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py --locations configs/locations.json --update-from-db --yes --chunk-days 1
+```
+
+## Troubleshooting
+
+### Lỗi thường gặp
+
+#### HDFS Safe Mode
+```bash
+hdfs dfsadmin -safemode leave
+```
+
+#### Connection issues
+- Kiểm tra network connectivity đến `khoa-master:9000`
+- Verify Hadoop client configuration
+
+#### API Rate Limiting  
+- Tăng `--chunk-days` để giảm frequency
+- Sử dụng `time.sleep(0.2)` trong code để pacing
+
+#### Memory errors với large ranges
+- Giảm `--chunk-days` xuống 5-7
+- Chia nhỏ range thành multiple runs
+
+### Logs và debugging
+- **YARN logs**: `yarn logs -applicationId <app_id>`
+- **Local cache**: `.cache/` directory
+- **Spark staging**: `/user/<username>/.sparkStaging/`
+
+### Recovery procedures
+1. Kiểm tra logs để tìm root cause
+2. Sử dụng `--mode replace-range` để re-ingest failed range
+3. Validate data quality sau khi recovery
+
+### Cleanup commands
+```bash
+# Clear Spark staging
+hdfs dfs -rm -r /user/$USER/.sparkStaging/*
+
+# Clear local cache  
+rm -rf .cache/ spark-warehouse/
+
+# System cleanup (WSL2/Docker)
+sudo rm -rf /tmp/* /var/tmp/*
+sudo fstrim -av
+```
+
+## Performance Notes
+
+### API Optimization
+- **Chunking**: 7-14 ngày cho historical, 1-3 ngày cho incremental
+- **Caching**: 1-hour HTTP cache để tránh redundant calls
+- **Rate limiting**: 0.2s delay giữa các API calls
+
+### Iceberg Optimization  
+- **Partitioning**: `days(ts)` cho efficient time-based queries
+- **File sizing**: Target 128MB files cho optimal scan performance
+- **Compaction**: Auto-compaction sau mỗi ingest để tối ưu file layout
+
+Để biết thêm chi tiết về ingest process, xem `docs/ingest_bronze.md`.
 
 ### Environment knobs
 
