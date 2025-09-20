@@ -196,6 +196,7 @@ gcloud_credentials
 /outputs/
 /results/
 /work/
+/artifacts/
 
 # Ignore jobs and notebooks checkpoints
 /jobs/**/__pycache__/
@@ -206,6 +207,20 @@ gcloud_credentials
 
 # Ignore local scripts created during development
 /scripts/*.log
+
+# Requests cache used by jobs (local HTTP cache)
+.cache
+
+# Temporary zero-fill file used to compact WSL/Docker images
+zero.fill
+
+# Windows VHDX images used by Docker Desktop / WSL2
+*.vhdx
+
+# Local Hive/Derby metastore and related runtime files
+metastore_db/
+derby.log
+.cache.sqlite
 
 # Terraform
 .terraform/

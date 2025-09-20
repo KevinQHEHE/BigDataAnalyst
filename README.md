@@ -161,3 +161,65 @@ Prompt template (example):
 
 This repo does not currently include a license file. Add an appropriate license if you intend to share the code publicly.
 
+
+## Validation (Bronze table)
+
+A small validation job is available to check the Bronze Iceberg table `hadoop_catalog.aq.raw_open_meteo_hourly`.
+
+File: `jobs/ingest/check_bronze.py`
+
+What it does:
+- Verifies the table exists and reads it via the project's Spark session builder
+- Checks schema columns and reports missing/extra columns
+- Computes null rates per column and warns if a column has a very high null rate
+- Detects negative values for numeric pollutant columns
+- Finds duplicate (location_id, ts) groups and reports a small sample
+- Reports per-location min/max timestamps and row counts
+
+Run (example):
+
+```bash
+# from project root
+PYTHONPATH=src spark-submit jobs/ingest/check_bronze.py
+```
+
+Exit codes:
+- 0: all checks passed (no errors)
+- 1: fatal errors (for example, table missing or required columns missing)
+
+The script prints a JSON report to stdout. Use this report for automated monitoring or quick manual inspection.
+
+## Bronze ingest guide
+
+See `docs/ingest_bronze.md` for a complete step-by-step guide to ingesting Open-Meteo air-quality data into the Bronze Iceberg table `hadoop_catalog.aq.raw_open_meteo_hourly`.
+
+Quick examples
+
+1) Check and leave HDFS safe mode (if required):
+
+```bash
+hdfs dfsadmin -safemode get
+hdfs dfsadmin -safemode leave
+```
+
+2) Ingest a date range (example with 10-day chunks):
+
+```bash
+bash script/submit_yarn.sh ingest/open_meteo_bronze.py \
+	--locations configs/locations.json \
+	--start-date 2024-01-01 \
+	--end-date 2024-01-31 \
+	--chunk-days 10
+```
+
+3) Update from latest timestamp in the database to now (auto-backfill if empty):
+
+```bash
+bash script/submit_yarn.sh ingest/open_meteo_bronze.py \
+	--locations configs/locations.json \
+	--update-from-db --yes \
+	--chunk-days 10
+```
+
+The full documentation with SQL checks, CLI options and maintenance notes is available at `docs/ingest_bronze.md`.
+

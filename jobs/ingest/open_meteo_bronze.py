@@ -1,6 +1,5 @@
 import argparse, json, uuid, time, os
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import requests_cache
 from retry_requests import retry
@@ -105,29 +104,62 @@ def ensure_tables(spark):
 
 def main():
     ap = argparse.ArgumentParser()
-    default_locations = os.getenv(
-        "LOCATIONS_CONFIG",
-        str(Path(__file__).resolve().parents[2] / "configs" / "locations.json")
-    )
-
-    ap.add_argument(
-        "--locations",
-        default=default_locations,
-        help="JSON file with {name:{latitude,longitude}} (default: %(default)s)",
-    )
-    ap.add_argument("--start-date", help="YYYY-MM-DD (UTC)", required=True)
-    ap.add_argument("--end-date",   help="YYYY-MM-DD (UTC)", required=True)
+    ap.add_argument("--locations", required=True, help="JSON file with {name:{latitude,longitude}}")
+    ap.add_argument("--start-date", help="YYYY-MM-DD (UTC)", required=False)
+    ap.add_argument("--end-date",   help="YYYY-MM-DD (UTC)", required=False)
     ap.add_argument("--chunk-days", type=int, default=10, help="split API calls into <=N-day chunks")
+    ap.add_argument("--update-from-db", action="store_true", help="compute start date from max(ts) in DB and fetch from that date to now")
+    ap.add_argument("--yes", action="store_true", help="auto-confirm prompts (useful for non-interactive/backfill)")
     args = ap.parse_args()
 
+    # If not using --update-from-db, require explicit start/end dates
+    if not args.update_from_db:
+        if not args.start_date or not args.end_date:
+            ap.error("the following arguments are required: --start-date, --end-date (or use --update-from-db)")
     spark = build("ingest_open_meteo_bronze")
     ensure_tables(spark)
 
+    # If requested, compute start/end dates from DB
+    if args.update_from_db:
+        # check whether table exists and get max(ts)
+        try:
+            if spark.catalog.tableExists("hadoop_catalog.aq.raw_open_meteo_hourly"):
+                row = spark.sql("SELECT MAX(ts) AS max_ts FROM hadoop_catalog.aq.raw_open_meteo_hourly").collect()
+                max_ts = row[0][0] if row and row[0] and row[0][0] is not None else None
+            else:
+                max_ts = None
+        except Exception as e:
+            print(f"[WARN] failed to inspect existing table: {e}")
+            max_ts = None
+
+        if max_ts is None:
+            msg = "No existing data found in hadoop_catalog.aq.raw_open_mete_hourly. Do you want to backfill from 2023-01-01 to today? [y/N]: "
+            proceed = False
+            if args.yes:
+                proceed = True
+            else:
+                try:
+                    ans = input(msg)
+                    proceed = ans.strip().lower() in ("y","yes")
+                except Exception:
+                    proceed = False
+
+            if not proceed:
+                print("[INFO] Aborting because no data to update and backfill not confirmed.")
+                return
+            start_date = datetime.fromisoformat("2023-01-01")
+            end_date = datetime.now(timezone.utc)
+        else:
+            # start from the next hour after max_ts to avoid duplicates
+            start_date = max_ts + timedelta(seconds=1)
+            end_date = datetime.now(timezone.utc)
+
+        # Replace args.start_date/ end_date for the run
+        args.start_date = start_date.strftime("%Y-%m-%d")
+        args.end_date = end_date.strftime("%Y-%m-%d")
+
     client = new_client()
     run_id = str(uuid.uuid4())
-
-    if not os.path.exists(args.locations):
-        raise FileNotFoundError(f"Locations config not found: {args.locations}")
 
     locations = load_locations(args.locations)
     start0 = datetime.fromisoformat(args.start_date)
