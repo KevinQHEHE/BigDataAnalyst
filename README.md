@@ -6,12 +6,20 @@ Pipeline thu thập dữ liệu chất lượng không khí theo giờ từ Open
 
 ### Data Layer
 - **Bronze Layer** (`hadoop_catalog.aq.raw_open_meteo_hourly`) – Bảng Iceberg lưu trữ dữ liệu thô từ Open-Meteo API, với key là `(location_id, ts)`. Dữ liệu được ghi thông qua `MERGE` operation với UUID và timestamp để truy xuất lineage.
+- **Silver Layer** – Các bảng được chuẩn hoá để phục vụ tính toán chỉ số:
+  - `aq.silver.air_quality_hourly_clean`: đổi tên cột, chuẩn hoá `ts_utc`, thêm cờ chất lượng (`valid_flags`).
+  - `aq.silver.aq_components_hourly`: tính rolling components (24h trung bình cho PM, 8h max cho O₃/CO, 1h max cho NO₂/SO₂) cùng cờ `component_valid_flags`.
+  - `aq.silver.aq_index_hourly`: tính AQI tổng hợp, AQI theo pollutant, pollutant chi phối và nhãn category.
 
 ### Các thành phần chính
 - **Ingest Job** (`jobs/ingest/open_meteo_bronze.py`) – Thu thập dữ liệu từ API và ghi vào Bronze
+- **Silver Clean Job** (`jobs/silver/clean_hourly.py`) – Lấy dữ liệu Bronze, chuẩn hoá schema & metadata và ghi vào `aq.silver.air_quality_hourly_clean`
+- **Silver Components Job** (`jobs/silver/components_hourly.py`) – Tính toán rolling components cần cho AQI, ghi vào `aq.silver.aq_components_hourly`
+- **Silver AQI Job** (`jobs/silver/index_hourly.py`) – Tính AQI tổng hợp & pollutant chi phối, ghi vào `aq.silver.aq_index_hourly`
 - **Spark Session Builder** (`src/aq_lakehouse/spark_session.py`) – Cấu hình Spark với Iceberg catalogs
 - **Submit Script** (`scripts/submit_yarn.sh`) – Helper script để submit PySpark jobs lên YARN
 - **Location Config** (`configs/locations.json`) – Định nghĩa các địa điểm và tọa độ
+- **Validation Notebook** (`notebooks/silver_validation.ipynb`) – Kiểm tra counts, null-rate và sample windows cho các bảng Silver
 
 ## Cài đặt nhanh
 
@@ -40,6 +48,24 @@ bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
     --start-date 2024-01-01 \
     --end-date 2024-01-31 \
     --chunk-days 10
+```
+
+### 3b. Xây dựng bảng Silver cho cùng khoảng thời gian
+```bash
+# Chuẩn hoá Bronze -> Silver clean
+bash scripts/submit_yarn.sh silver/clean_hourly.py \
+    --start 2024-01-01T00:00:00 \
+    --end   2024-01-31T23:00:00
+
+# Tính rolling components
+bash scripts/submit_yarn.sh silver/components_hourly.py \
+    --start 2024-01-01T00:00:00 \
+    --end   2024-01-31T23:00:00
+
+# Tính AQI hourly
+bash scripts/submit_yarn.sh silver/index_hourly.py \
+    --start 2024-01-01T00:00:00 \
+    --end   2024-01-31T23:00:00
 ```
 
 ### 4. Update incremental từ database hiện tại
@@ -119,8 +145,12 @@ ingested_at TIMESTAMP       -- Thời gian ingest
 ```
 configs/locations.json              # Danh sách địa điểm và tọa độ
 jobs/ingest/open_meteo_bronze.py   # Logic ingest Bronze (MERGE + maintenance)
+jobs/silver/clean_hourly.py        # Bronze -> Silver clean table
+jobs/silver/components_hourly.py   # Silver clean -> components (rolling)
+jobs/silver/index_hourly.py        # Silver components -> AQI index
 src/aq_lakehouse/spark_session.py # Spark session builder với Iceberg config  
 scripts/submit_yarn.sh             # Helper submit PySpark jobs to YARN
+notebooks/silver_validation.ipynb # Notebook validation counts/null rates sample windows
 docs/ingest_bronze.md              # Hướng dẫn chi tiết ingest Bronze
 requirements.txt                   # Python dependencies
 ```

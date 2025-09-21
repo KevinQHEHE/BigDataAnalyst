@@ -76,6 +76,7 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 *.ipynb
+!notebooks/*.ipynb
 
 # IPython
 profile_default/
@@ -259,5 +260,9 @@ coverage/
 # Optional: exclude large dataset directories if present
 data_raw/
 data_processed/
+
+# Local Hive/Metastore DB and runtime cache files
+metastore_db/
+.cache.sqlite
 
 # Keep this line at end
