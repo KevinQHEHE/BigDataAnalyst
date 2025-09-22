@@ -64,3 +64,92 @@ This note documents the structure and assumptions behind the three Silver-layer 
 - Run windows in Silver jobs should align: execute `clean_hourly`, then `components_hourly`, then `index_hourly` for the same `--start/--end` to guarantee downstream completeness.
 - When gaps exist or a rerun is necessary, use `--mode replace` to delete existing rows for the requested window before merging new results.
 - Use `notebooks/silver_validation.ipynb` for day-level row counts, null-ratio inspection, and SQL sanity-checks after each batch run.
+
+Additional operational guidance (post optimization)
+
+- Prefer running the Silver pipeline with the repository wrappers so pre-staged libraries on HDFS are used and submission overhead is minimized. Use `scripts/run_silver_range.sh` to run the full Silver pipeline for a date range (it executes `clean_hourly` then `components_hourly` then `index_hourly` in the correct order unless flags restrict steps).
+
+- For single-step runs or ad-hoc testing, use `scripts/submit_yarn.sh` which consumes `.env` to decide whether to use the experimental `SPARK_YARN_ARCHIVE` or the recommended `SPARK_YARN_JARS`/`SPARK_PYFILES` approach. Example:
+
+```bash
+# Full range run (preferred for large windows)
+bash scripts/run_silver_range.sh --start 2024-01-01T00:00:00 --end 2024-01-31T23:00:00
+
+# Run only clean step for a small window (ad-hoc)
+bash scripts/submit_yarn.sh silver/clean_hourly.py --start 2024-08-01T00:00:00 --end 2024-08-31T23:00:00 --mode replace
+```
+
+- Environment/config notes:
+  - Ensure `.env` contains `SPARK_YARN_JARS` and `SPARK_PYFILES` pointing at HDFS (e.g. `hdfs://khoa-master:9000/spark/jars/*` and `hdfs://khoa-master:9000/spark/python/pyspark.zip,...`). This allows the submit wrapper to avoid uploading hundreds of jars on every job.
+  - `SPARK_YARN_ARCHIVE` is supported but experimental; only set it if you purposely created a validated Spark distribution tarball on HDFS.
+
+- Run ordering and idempotency:
+  - The wrapper scripts support `--mode replace` to remove existing Silver records for the window before writing. This is useful for deterministic reruns.
+  - When running the full range, the range script handles look-back for components (so you don't need to manage historical padding manually).
+
+- Validation and quick checks:
+  - After a run, open `notebooks/silver_validation.ipynb` or run the lightweight validation SQL in the notebook to verify row counts per `location_id` and date ranges.
+  - Monitor Spark submission logs; if you see many "Not copying" messages for `/spark/jars/` then the pre-staged approach worked correctly.
+
+## Troubleshooting Common Issues
+
+### OutOfMemoryError During Large Date Ranges
+
+**Symptoms**: Executor failures with `java.lang.OutOfMemoryError: Java heap space` during Iceberg writes, especially when processing ranges longer than 6 months.
+
+**Root Cause**: Default memory settings (512MB executor memory + 256MB overhead) are insufficient for processing large amounts of data in a single Spark application.
+
+**Solutions**:
+
+1. **Automatic Chunking** (Recommended): Use the built-in chunking feature in `run_silver_range.sh`:
+   ```bash
+   # Automatically splits ranges >6 months into chunks
+   bash scripts/run_silver_range.sh --start 2024-01-01 --end 2025-09-30
+   
+   # Custom chunk size (4 months)
+   bash scripts/run_silver_range.sh --start 2024-01-01 --end 2025-09-30 --chunk-months 4
+   
+   # Disable chunking for testing (not recommended for large ranges)
+   bash scripts/run_silver_range.sh --start 2024-01-01 --end 2025-09-30 --no-chunking
+   ```
+
+2. **Memory Tuning**: Adjust memory settings in `.env` for your cluster capacity:
+   ```properties
+   # For large ranges - requires YARN_MAX_ALLOCATION_MB >= 2048
+   SPARK_EXECUTOR_INSTANCES=2
+   SPARK_EXECUTOR_CORES=2
+   SPARK_EXECUTOR_MEMORY=1536m
+   SPARK_EXECUTOR_MEMORY_OVERHEAD=512m
+   SPARK_DRIVER_MEMORY=1g
+   YARN_MAX_ALLOCATION_MB=4096
+   ```
+
+3. **Incremental Processing**: Process smaller date ranges sequentially:
+   ```bash
+   # Process monthly chunks manually
+   for month in 01 02 03 04 05 06 07 08 09 10 11 12; do
+     bash scripts/run_silver_range.sh --start "2024-${month}-01T00:00:00" --end "2024-${month}-31T23:00:00"
+   done
+   ```
+
+### YARN Application Failures
+
+**Symptoms**: `YARN application has exited unexpectedly with state FAILED! Max number of executor failures (3) reached`
+
+**Common Causes**:
+- Insufficient memory allocation for executors
+- Node hardware issues or resource contention
+- Network connectivity problems between YARN nodes
+
+**Solutions**:
+1. Check YARN ResourceManager logs for detailed failure reasons
+2. Increase memory overhead: `SPARK_EXECUTOR_MEMORY_OVERHEAD=768m` 
+3. Reduce parallelism: `SPARK_EXECUTOR_INSTANCES=1` for problematic ranges
+4. Use chunked processing to reduce memory pressure per job
+
+### Performance Optimization Tips
+
+1. **Monitor Memory Usage**: Check Spark UI for GC time and memory utilization
+2. **Adjust Shuffle Partitions**: Increase `SPARK_SQL_SHUFFLE_PARTITIONS` for large datasets
+3. **Enable Kryo Serialization**: Already configured in submit script for better performance
+4. **Use Pre-staged Jars**: Verify `SPARK_YARN_JARS` is configured to avoid jar upload overhead
