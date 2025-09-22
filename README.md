@@ -14,8 +14,41 @@ Pipeline thu thập dữ liệu chất lượng không khí theo giờ từ Open
 ### Các thành phần chính
 - **Ingest Job** (`jobs/ingest/open_meteo_bronze.py`) – Thu thập dữ liệu từ API và ghi vào Bronze
 - **Silver Clean Job** (`jobs/silver/clean_hourly.py`) – Lấy dữ liệu Bronze, chuẩn hoá schema & metadata và ghi vào `aq.silver.air_quality_hourly_clean`
+- **Silver Clean Job chi tiết**:
+  1. Đọc tham số `--start/--end`, danh sách `--location-id` và chế độ ghi `--mode` (merge hoặc replace). Vai trò: xác định khung thời gian/điểm đo cần xử lý.
+  2. Khởi tạo Spark session với Iceberg, đảm bảo bảng `aq.silver.air_quality_hourly_clean` tồn tại (schema có `ts_utc`, `date_utc`, các cột pollutant, `valid_flags`, metadata) và partition theo `(location_id, days(ts_utc))`.
+  3. Nạp dữ liệu từ `aq.raw_open_meteo_hourly` trong khoảng thời gian yêu cầu; nếu không có bản ghi thì kết thúc run.
+  4. Chuẩn hoá dữ liệu:
+     - Đổi tên cột (`pm2_5 → pm25`, `aerosol_optical_depth → aod`, …) và chuẩn timestamp `ts → ts_utc` (UTC).
+     - Sinh thêm `date_utc`, `run_id`, `ingested_at`, `notes`, đồng thời giữ lại `bronze_run_id/bronze_ingested_at` để truy xuất lineage.
+     - Tạo `valid_flags` (map boolean) cho từng chỉ số (`pm25_nonneg`, `o3_nonneg`, …) và thông tin hiện diện `ts/latitude/longitude`.
+  5. Nếu chạy ở chế độ `--mode replace`, xóa trước các bản ghi Silver nằm trong khung thời gian tương ứng.
+  6. Ghi vào bảng Silver bằng Iceberg `MERGE INTO`: nếu key `(location_id, ts_utc)` đã tồn tại thì cập nhật, ngược lại chèn mới.
+  7. In thống kê `MIN/MAX/COUNT` theo `location_id` và `RUN_ID` để theo dõi việc ingest.
 - **Silver Components Job** (`jobs/silver/components_hourly.py`) – Tính toán rolling components cần cho AQI, ghi vào `aq.silver.aq_components_hourly`
+- **Silver Components Job chi tiết**:
+  1. Nhận tham số `--start/--end`, `--location-id`, chế độ ghi `--mode` và `--calc-method`. Xác định khoảng giờ sẽ tính và ghi nhận tên phương pháp (mặc định `simple_rolling_v1`).
+  2. Khởi tạo Spark session, đảm bảo bảng `aq.silver.aq_components_hourly` tồn tại với schema: các cột rolling (`pm25_24h_avg`, `pm10_24h_avg`, `o3_8h_max`, `co_8h_max`, `no2_1h_max`, `so2_1h_max`), `component_valid_flags`, `calc_method`, `run_id`, `computed_at`, partition `(location_id, days(ts_utc))`.
+  3. Đọc bảng clean `aq.silver.air_quality_hourly_clean` với window mở rộng để đủ dữ liệu quá khứ (ví dụ 24h cho PM, 8h cho O₃/CO). Nếu không có dữ liệu thì dừng.
+  4. Với từng location, tạo Window functions:
+     - 24h trailing average cho PM2.5/PM10, 8h trailing max cho O₃/CO.
+     - Đếm số giờ hợp lệ trong từng window và kiểm tra nhịp 1 giờ (`continuous_hour`).
+  5. Sinh các cột kết quả: chỉ tính giá trị rolling khi đủ dữ liệu (`>=18` giờ cho PM, `>=6` giờ cho O₃/CO); NO₂/SO₂ lấy giá trị giờ hiện tại. Đồng thời tạo `component_valid_flags` (ví dụ `pm25_24h_sufficient`, `o3_8h_sufficient`, `no2_present`, …), `calc_method`, `run_id`, `computed_at`, `date_utc`.
+  6. Giới hạn DataFrame về đúng khoảng `[start, end]`. Nếu không còn bản ghi thì kết thúc.
+  7. Với `--mode replace`, xóa trước các record trong khoảng target; sau đó dùng Iceberg `MERGE INTO` để upsert theo key `(location_id, ts_utc)`.
+  8. In thống kê `MIN/MAX/COUNT` theo `location_id` và `RUN_ID` để theo dõi kết quả tính toán.
 - **Silver AQI Job** (`jobs/silver/index_hourly.py`) – Tính AQI tổng hợp & pollutant chi phối, ghi vào `aq.silver.aq_index_hourly`
+- **Silver AQI Job chi tiết**:
+  1. Đọc tham số `--start/--end`, danh sách `--location-id`, chế độ ghi `--mode` và tên phương pháp `--calc-method` (mặc định `epa_like_v1`).
+  2. Khởi tạo Spark session, đảm bảo bảng `aq.silver.aq_index_hourly` tồn tại với schema gồm `aqi`, `category`, `dominant_pollutant`, từng AQI theo pollutant và metadata (`calc_method`, `run_id`, `computed_at`), partition `(location_id, days(ts_utc))`.
+  3. Nạp bảng components `aq.silver.aq_components_hourly` trong khoảng thời gian yêu cầu; nếu chưa có dữ liệu thì dừng run.
+  4. Nội suy AQI theo chuẩn EPA:
+     - Chuyển đổi đơn vị (µg/m³ → ppm/ppb) bằng molar mass và thể tích molar.
+     - Sử dụng bảng breakpoints để tính AQI PM₂.₅, PM₁₀, O₃, NO₂, SO₂, CO.
+  5. Lấy AQI tổng bằng giá trị lớn nhất trong các AQI thành phần; ánh xạ sang category (“Good”, “Moderate”, …); xác định pollutant chi phối (pollutant cho AQI lớn nhất).
+  6. Ghi metadata (`calc_method`, `run_id`, `computed_at`, `date_utc`) và chọn cột theo schema output.
+  7. Nếu `--mode replace` thì xóa các bản ghi trong khoảng target trước khi ghi; sau đó dùng `MERGE INTO` upsert theo `(location_id, ts_utc)`.
+  8. In thống kê min/max/count theo `location_id` và `RUN_ID` để theo dõi kết quả.
 - **Spark Session Builder** (`src/aq_lakehouse/spark_session.py`) – Cấu hình Spark với Iceberg catalogs
 - **Submit Script** (`scripts/submit_yarn.sh`) – Helper script để submit PySpark jobs lên YARN
 - **Location Config** (`configs/locations.json`) – Định nghĩa các địa điểm và tọa độ

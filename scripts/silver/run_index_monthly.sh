@@ -27,18 +27,10 @@ windows=(
 
 for window in "${windows[@]}"; do
   read start end <<<"$window"
-  echo "=> Running index for $start -> $end"
+  echo "=> Running index job for $start -> $end"
   bash scripts/submit_yarn.sh silver/index_hourly.py \
     --start "$start" \
     --end   "$end"
   echo "=> Finished: $start -> $end"
   echo "-------------------------------------------"
 done
-
-cat <<'SQL'
--- Kiểm tra dữ liệu đã ghi vào bảng AQI Index
-SELECT COUNT(*) AS rows,
-       MIN(ts_utc) AS min_ts,
-       MAX(ts_utc) AS max_ts
-FROM hadoop_catalog.aq.silver.aq_index_hourly;
-SQL
