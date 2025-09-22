@@ -189,7 +189,6 @@ def delete_existing(spark, start_ts: datetime, end_ts: datetime, location_ids: I
     logging.info("Deleting existing Silver rows where %s", condition)
     spark.sql(f"DELETE FROM {SILVER_TABLE} WHERE {condition}")
 
-
 def write_to_table(spark, df: DataFrame) -> None:
     temp_view = f"staging_clean_{uuid.uuid4().hex}"
     df.createOrReplaceTempView(temp_view)

@@ -53,9 +53,13 @@ CMD=("${SPARK_CMD[@]}"
   --conf spark.yarn.maxAppAttempts=1
   --conf spark.dynamicAllocation.enabled=true
   --conf spark.dynamicAllocation.minExecutors=1
-  --conf spark.dynamicAllocation.maxExecutors=6
+  --conf spark.dynamicAllocation.maxExecutors=2
+  --conf spark.executor.cores=1
+  --conf spark.executor.memory=768m
+  --conf spark.executor.memoryOverhead=192m
+  --conf spark.driver.memory=768m
+  --conf spark.sql.shuffle.partitions=4
   "$RESOLVED_APP" "$@"
 )
-
 echo "+ ${CMD[*]}"
 exec "${CMD[@]}"
