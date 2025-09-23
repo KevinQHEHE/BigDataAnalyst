@@ -12,7 +12,7 @@ This note documents the structure and assumptions behind the three Silver-layer 
 ## Table: aq.silver.air_quality_hourly_clean
 
 - **Purpose** – Canonical hourly measurements with renamed pollutant columns, normalised timestamps, and preserved source metadata.
-- **Inputs** – `hadoop_catalog.aq.raw_open_meteo_hourly` Bronze table.
+- **Inputs** – `hadoop_catalog.aq.bronze.raw_open_meteo_hourly` Bronze table.
 - **Key columns**
   - `location_id`, `ts_utc`, `date_utc` – spatial/temporal keys in UTC.
   - Pollutants: `aod`, `pm25`, `pm10`, `dust`, `no2`, `o3`, `so2`, `co`, `uv_index`, `uv_index_clear_sky`.

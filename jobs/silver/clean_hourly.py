@@ -8,7 +8,7 @@ from pyspark.sql import DataFrame, functions as F, types as T
 
 from aq_lakehouse.spark_session import build
 
-BRONZE_TABLE = "hadoop_catalog.aq.raw_open_meteo_hourly"
+BRONZE_TABLE = "hadoop_catalog.aq.bronze.raw_open_meteo_hourly"
 SILVER_TABLE = "hadoop_catalog.aq.silver.air_quality_hourly_clean"
 
 

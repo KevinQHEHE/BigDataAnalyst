@@ -17,7 +17,7 @@ applyTo: '**'
 **Bronze source (already ingested)**:
 - Catalog: `hadoop_catalog`
 - DBs: `aq` (analytics), `ref` (reference)
-- Bronze table: `aq.raw_open_meteo_hourly`
+- Bronze table: `aq.bronze.raw_open_meteo_hourly`
 - Columns: `location_id`, `latitude`, `longitude`, `ts`, `aerosol_optical_depth`, `pm2_5`, `pm10`, `dust`, `nitrogen_dioxide`, `ozone`, `sulphur_dioxide`, `carbon_monoxide`, `uv_index`, `uv_index_clear_sky`, `source`, `run_id`, `ingested_at`
 
 **Config & code layout (current)**:
@@ -54,7 +54,7 @@ applyTo: '**'
 
 ## Naming & Table Placement (Iceberg)
 
-**Bronze (raw)**: `hadoop_catalog.aq.raw_open_meteo_hourly` ✓ (exists)
+**Bronze (raw)**: `hadoop_catalog.aq.bronze.raw_open_meteo_hourly` ✓ (exists)
 
 **Silver (cleaned & conformed)**: `hadoop_catalog.aq.s_clean_hourly`
 
@@ -130,7 +130,7 @@ def build(app_name: str) -> SparkSession:
 ## Lakehouse Layer Contracts (inputs/outputs)
 
 **Bronze → Silver**:
-- Input: `aq.raw_open_meteo_hourly` (raw hourly metrics from Open-Meteo API)
+- Input: `aq.bronze.raw_open_meteo_hourly` (raw hourly metrics from Open-Meteo API)
 - Output: `aq.s_clean_hourly` with standardized units, deduped `(location_id, ts)`, cleaned nulls, and source lineage columns `ingested_at`, `run_id`
 
 **Silver → Gold**:
@@ -146,8 +146,8 @@ def build(app_name: str) -> SparkSession:
 # Example: Ingest data for date range
 bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
     --locations configs/locations.json \
-    --start-date 2024-01-01 \
-    --end-date 2024-01-31 \
+    --start 2024-01-01 \
+    --end 2024-01-31 \
     --chunk-days 10
 
 # Example: Update from database (incremental)  

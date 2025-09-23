@@ -4,43 +4,31 @@ Tài liệu này hướng dẫn chi tiết quy trình ingest dữ liệu chất 
 
 ## Tổng quan
 
-Bronze layer là nơi lưu trữ dữ liệu thô (raw data) từ các nguồn bên ngoài. Dữ liệu được lưu trữ trong bảng Iceberg `hadoop_catalog.aq.raw_open_meteo_hourly` với cấu trúc:
+Bronze layer là nơi lưu trữ dữ liệu thô (raw data) từ các nguồn bên ngoài. Dữ liệu được lưu trữ trong bảng Iceberg `hadoop_catalog.aq.bronze.raw_open_meteo_hourly` với cấu trúc (theo thứ tự và tên cột trong code):
 
-```sql
-location_id STRING,           -- Tên địa điểm (key từ locations.json)  
-latitude DOUBLE,             -- Vĩ độ
-longitude DOUBLE,            -- Kinh độ
-ts TIMESTAMP,                -- Timestamp UTC của measurement
-aerosol_optical_depth DOUBLE, -- Độ sâu quang học aerosol
-pm2_5 DOUBLE,               -- PM2.5 concentration (μg/m³)
-pm10 DOUBLE,                -- PM10 concentration (μg/m³)
-dust DOUBLE,                -- Dust concentration (μg/m³)
-nitrogen_dioxide DOUBLE,     -- NO2 concentration (μg/m³)
-ozone DOUBLE,               -- O3 concentration (μg/m³)
-sulphur_dioxide DOUBLE,     -- SO2 concentration (μg/m³)
-carbon_monoxide DOUBLE,     -- CO concentration (mg/m³)
-uv_index DOUBLE,            -- UV Index
-uv_index_clear_sky DOUBLE,  -- UV Index (clear sky)
-source STRING,              -- Nguồn dữ liệu ("open_meteo")
-run_id STRING,              -- UUID của lần chạy ingest
-ingested_at TIMESTAMP       -- Timestamp khi data được ingest
-```
-
+- location_id STRING,        -- Chuỗi định danh địa điểm (ví dụ: "ha_noi")
+- latitude DOUBLE,           -- Vĩ độ (decimal degrees)
+- longitude DOUBLE,          -- Kinh độ (decimal degrees)
+- ts TIMESTAMP,              -- Timestamp UTC của measurement
+- aerosol_optical_depth DOUBLE, -- AOD (unitless)
+- pm2_5 DOUBLE,              -- PM2.5 (µg/m³)
+- pm10 DOUBLE,               -- PM10 (µg/m³)
+- dust DOUBLE,               -- Dust (µg/m³)
+- nitrogen_dioxide DOUBLE,   -- NO2 (µg/m³)
+- ozone DOUBLE,              -- O3 (µg/m³)
+- sulphur_dioxide DOUBLE,    -- SO2 (µg/m³)
+- carbon_monoxide DOUBLE,    -- CO (µg/m³)
+- uv_index DOUBLE,           -- UV index (unitless)
+- uv_index_clear_sky DOUBLE, -- Clear-sky UV index (unitless)
+- source STRING,             -- Nguồn dữ liệu ("open-meteo")
+- run_id STRING,             -- UUID của lần chạy ingest
+- ingested_at TIMESTAMP      -- Thời điểm ingest vào Bronze (UTC)
 ## Chuẩn bị môi trường
-
-### 1. Kiểm tra Safe Mode của HDFS
-Trước khi ingest, cần đảm bảo HDFS không ở safe mode:
 
 ```bash
 # Kiểm tra trạng thái safe mode
-hdfs dfsadmin -safemode get
-
-# Nếu safe mode đang ON, tắt safe mode
 hdfs dfsadmin -safemode leave
 ```
-
-### 2. Cấu hình môi trường
-Đảm bảo các biến môi trường được thiết lập:
 
 ```bash
 # Spark Home (nếu cần)
@@ -98,11 +86,7 @@ export WAREHOUSE_URI=hdfs://khoa-master:9000/warehouse/iceberg
   - `upsert`: Merge dữ liệu mới vào bảng (update nếu trùng key)
   - `replace-range`: Xóa dữ liệu trong range trước khi insert
 
-#### `--location-id`
-- **Type**: String (có thể dùng nhiều lần)
-- **Default**: [] (tất cả locations)
-- **Mô tả**: Giới hạn ingest chỉ một hoặc một số location_id cụ thể
-- **Ví dụ**: `--location-id "Hà Nội" --location-id "TP. Hồ Chí Minh"`
+Note: The ingest job reads locations from the JSON file you supply via `--locations`. To limit the run to a subset of locations, create a smaller JSON (for example `configs/locations_small.json`) containing only the entries you want and point `--locations` at it. See the example in the "Ingest chỉ một số địa điểm cụ thể" section.
 
 ## Các tình huống sử dụng
 
@@ -110,11 +94,10 @@ export WAREHOUSE_URI=hdfs://khoa-master:9000/warehouse/iceberg
 
 ```bash
 # Ingest dữ liệu từ 2024-01-01 đến 2024-01-31, chia chunk 10 ngày
-bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
-    --locations configs/locations.json \
-    --start-date 2024-01-01 \
-    --end-date 2024-01-31 \
-    --chunk-days 10
+bash scripts/submit_yarn.sh bronze/open_meteo_bronze.py \
+  --locations configs/locations.json \
+  --start 2024-01-01 --end 2024-01-31 \
+  --chunk-days 10
 ```
 
 ### 2. Update incremental từ database
@@ -122,43 +105,47 @@ bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
 ```bash
 # Update từ thời điểm mới nhất trong DB đến hiện tại
 # Nếu DB trống, sẽ hỏi có muốn backfill từ 2023-01-01 không
-bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
-    --locations configs/locations.json \
-    --update-from-db \
-    --chunk-days 10
+bash scripts/submit_yarn.sh bronze/open_meteo_bronze.py \
+  --locations configs/locations.json \
+  --update-from-db \
+  --chunk-days 10
 ```
 
 ### 3. Backfill tự động (non-interactive)
 
 ```bash
 # Backfill tự động từ 2023-01-01 nếu DB trống, hoặc update từ MAX(ts)
-bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
-    --locations configs/locations.json \
-    --update-from-db \
-    --yes \
-    --chunk-days 10
+bash scripts/submit_yarn.sh bronze/open_meteo_bronze.py \
+  --locations configs/locations.json \
+  --update-from-db \
+  --yes \
+  --chunk-days 10
 ```
+
+Note: The ingest job processes and MERGE each API chunk independently to reduce driver memory usage. Set `--chunk-days` smaller for very large backfills to limit per-chunk size.
 
 ### 4. Ingest chỉ một số địa điểm cụ thể
 
+To limit which locations are ingested, edit `configs/locations.json` to include only the locations you want to run for this job. The ingest job reads locations from that file and processes them in order.
+
+Example: create a small `configs/locations_small.json` containing only the desired entries and point the job to it:
+
 ```bash
-# Chỉ ingest dữ liệu cho Hà Nội và TP.HCM
-bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
-    --locations configs/locations.json \
-    --start-date 2024-01-01 \
-    --end-date 2024-01-31 \
-    --location-id "Hà Nội" \
-    --location-id "TP. Hồ Chí Minh"
+# Ingest only a reduced set of locations defined in configs/locations_small.json
+bash scripts/submit_yarn.sh bronze/open_meteo_bronze.py \
+  --locations configs/locations_small.json \
+  --start 2024-01-01 --end 2024-01-31 \
+  --chunk-days 10
 ```
 
 ### 5. Replace range (ingest lại dữ liệu)
 
 ```bash
 # Xóa và ingest lại dữ liệu trong range
-bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
+bash scripts/submit_yarn.sh bronze/open_meteo_bronze.py \
     --locations configs/locations.json \
-    --start-date 2024-01-01 \
-    --end-date 2024-01-07 \
+  --start 2024-01-01 \
+  --end 2024-01-07 \
     --mode replace-range
 ```
 
@@ -167,12 +154,14 @@ bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
 ### 1. Kết nối Spark SQL
 
 ```bash
-SPARK_HOME=${SPARK_HOME:-/home/dlhnhom2/spark} \
+ SPARK_HOME=${SPARK_HOME:-/home/dlhnhom2/spark}
 $SPARK_HOME/bin/spark-sql --master local[1] \
+  --conf spark.sql.catalogImplementation=in-memory \
   --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
   --conf spark.sql.catalog.hadoop_catalog=org.apache.iceberg.spark.SparkCatalog \
   --conf spark.sql.catalog.hadoop_catalog.type=hadoop \
   --conf spark.sql.catalog.hadoop_catalog.warehouse=hdfs://khoa-master:9000/warehouse/iceberg
+
 ```
 
 ### 2. Kiểm tra tables
@@ -186,15 +175,15 @@ SHOW TABLES IN hadoop_catalog.aq;
 
 ```sql
 -- Đếm tổng số rows
-SELECT COUNT(*) AS total_rows FROM hadoop_catalog.aq.raw_open_meteo_hourly;
+SELECT COUNT(*) AS total_rows FROM hadoop_catalog.aq.bronze.raw_open_meteo_hourly;
 
 -- Lấy sample dữ liệu mới nhất
-SELECT * FROM hadoop_catalog.aq.raw_open_meteo_hourly 
+SELECT * FROM hadoop_catalog.aq.bronze.raw_open_meteo_hourly 
 ORDER BY ts DESC LIMIT 20;
 
 -- Kiểm tra time range tổng thể
 SELECT MIN(ts) AS min_ts, MAX(ts) AS max_ts 
-FROM hadoop_catalog.aq.raw_open_meteo_hourly;
+FROM hadoop_catalog.aq.bronze.raw_open_meteo_hourly;
 ```
 
 ### 4. Phân tích dữ liệu theo địa điểm
@@ -202,13 +191,13 @@ FROM hadoop_catalog.aq.raw_open_meteo_hourly;
 ```sql
 -- Số lượng records theo địa điểm
 SELECT location_id, COUNT(*) AS total_records
-FROM hadoop_catalog.aq.raw_open_meteo_hourly
+FROM hadoop_catalog.aq.bronze.raw_open_meteo_hourly
 GROUP BY location_id
 ORDER BY total_records DESC;
 
 -- Time range theo từng địa điểm  
 SELECT location_id, MIN(ts) AS min_ts, MAX(ts) AS max_ts
-FROM hadoop_catalog.aq.raw_open_meteo_hourly
+FROM hadoop_catalog.aq.bronze.raw_open_meteo_hourly
 GROUP BY location_id
 ORDER BY location_id;
 ```
@@ -219,12 +208,12 @@ ORDER BY location_id;
 -- Tìm duplicates theo (ts, location_id)
 WITH dup AS (
   SELECT ts, location_id, COUNT(*) AS cnt
-  FROM hadoop_catalog.aq.raw_open_meteo_hourly
+  FROM hadoop_catalog.aq.bronze.raw_open_meteo_hourly
   GROUP BY ts, location_id
   HAVING COUNT(*) > 1
 )
 SELECT t.*
-FROM hadoop_catalog.aq.raw_open_meteo_hourly t
+FROM hadoop_catalog.aq.bronze.raw_open_meteo_hourly t
 JOIN dup d ON t.ts = d.ts AND t.location_id = d.location_id
 ORDER BY t.location_id, t.ts;
 
@@ -235,7 +224,7 @@ SELECT
   COUNT(pm10) AS pm10_non_null,
   COUNT(nitrogen_dioxide) AS no2_non_null,
   COUNT(ozone) AS o3_non_null
-FROM hadoop_catalog.aq.raw_open_meteo_hourly;
+FROM hadoop_catalog.aq.bronze.raw_open_meteo_hourly;
 ```
 
 ## Xử lý dữ liệu và maintenance
@@ -245,10 +234,10 @@ FROM hadoop_catalog.aq.raw_open_meteo_hourly;
 ```sql
 -- ⚠️ CHỈ THỰC HIỆN KHI MUỐN INGEST LẠI DATA
 -- Truncate toàn bộ bảng
-TRUNCATE TABLE hadoop_catalog.aq.raw_open_meteo_hourly;
+TRUNCATE TABLE hadoop_catalog.aq.bronze.raw_open_meteo_hourly;
 
 -- Hoặc xóa theo điều kiện
-DELETE FROM hadoop_catalog.aq.raw_open_meteo_hourly 
+DELETE FROM hadoop_catalog.aq.bronze.raw_open_meteo_hourly 
 WHERE ts >= '2024-01-01' AND ts <= '2024-01-31';
 ```
 
@@ -259,18 +248,18 @@ Các thao tác maintenance được tự động chạy sau mỗi lần ingest:
 ```sql
 -- Rewrite data files để tối ưu kích thước
 CALL hadoop_catalog.system.rewrite_data_files(
-  'aq.raw_open_meteo_hourly',
+  'aq.bronze.raw_open_meteo_hourly',
   map('target-file-size-bytes', CAST(134217728 AS bigint))
 );
 
 -- Expire old snapshots (giữ 30 ngày gần nhất)
 CALL hadoop_catalog.system.expire_snapshots(
-  'aq.raw_open_meteo_hourly',
+  'aq.bronze.raw_open_meteo_hourly',
   CURRENT_TIMESTAMP - INTERVAL 30 DAYS
 );
 
 -- Xóa orphan files
-CALL hadoop_catalog.system.remove_orphan_files('aq.raw_open_meteo_hourly');
+CALL hadoop_catalog.system.remove_orphan_files('aq.bronze.raw_open_meteo_hourly');
 ```
 
 ## Troubleshooting
