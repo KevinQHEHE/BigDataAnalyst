@@ -133,4 +133,6 @@ spark.sql.catalog.hadoop_catalog.warehouse hdfs://khoa-master:9000/warehouse/ice
 - Automate startup ordering: Hadoop (HDFS/YARN) → Spark jobs (via YARN) → Iceberg table creation scripts → Superset application.
 - Rotate the Superset `SECRET_KEY` and re-check `superset.log` after the next launch to ensure datetime parsing remains resolved.
 - Keep the Spark Thrift Server process under supervision (YARN app `spark-thriftserver-iceberg`) so Superset/SQL clients retain access to HiveServer2 endpoints.
+
+- Iceberg write guidance: the `aq.silver.aq_components_hourly` table now targets smaller Parquet files (32MB) and the components job will repartition computed dataframes before the Iceberg MERGE to avoid single-task driver writes. If you observe `java.lang.OutOfMemoryError` during local writes, increase `SPARK_DRIVER_MEMORY` and `SPARK_SQL_SHUFFLE_PARTITIONS` in the repository `.env` (for example `SPARK_DRIVER_MEMORY=12g` and `SPARK_SQL_SHUFFLE_PARTITIONS=200`), or run the job on Yarn/standalone so work is distributed across executors.
 - Confirm Spark workers on slave nodes and ensure warehouse path permissions align with jobs executed via PySpark.

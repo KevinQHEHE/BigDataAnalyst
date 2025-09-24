@@ -27,7 +27,7 @@ windows=(
 for window in "${windows[@]}"; do
   read start end <<<"$window"
   echo "=> Running components for $start -> $end"
-  bash scripts/submit_yarn.sh silver/components_hourly.py \
+  bash scripts/run_spark.sh --mode yarn jobs/silver/components_hourly.py \
     --start "$start" \
     --end   "$end"
   echo "=> Finished: $start -> $end"

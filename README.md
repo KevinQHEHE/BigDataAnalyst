@@ -50,7 +50,7 @@ Pipeline thu thập dữ liệu chất lượng không khí theo giờ từ Open
   7. Nếu `--mode replace` thì xóa các bản ghi trong khoảng target trước khi ghi; sau đó dùng `MERGE INTO` upsert theo `(location_id, ts_utc)`.
   8. In thống kê min/max/count theo `location_id` và `RUN_ID` để theo dõi kết quả.
 - **Spark Session Builder** (`src/aq_lakehouse/spark_session.py`) – Cấu hình Spark với Iceberg catalogs
-- **Submit Script** (`scripts/submit_yarn.sh`) – Helper script để submit PySpark jobs lên YARN
+- **Submit Script** (`scripts/run_spark.sh`) – Unified helper để submit PySpark jobs (supports --mode yarn|standalone|local)
 - **Location Config** (`configs/locations.json`) – Định nghĩa các địa điểm và tọa độ
 - **Validation Notebook** (`notebooks/silver_validation.ipynb`) – Kiểm tra counts, null-rate và sample windows cho các bảng Silver
 
@@ -75,8 +75,8 @@ hdfs dfsadmin -safemode leave
 
 ### 3. Chạy ingest đơn giản
 ```bash
-# Ingest dữ liệu từ 2024-01-01 đến 2024-01-31
-bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
+# Ingest dữ liệu từ 2024-01-01 đến 2024-01-31 (YARN)
+bash scripts/run_spark.sh --mode yarn jobs/bronze/open_meteo_bronze.py \
     --locations configs/locations.json \
   --start 2024-01-01 --end 2024-01-31 \
   --chunk-days 10
@@ -84,26 +84,26 @@ bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
 
 ### 3b. Xây dựng bảng Silver cho cùng khoảng thời gian
 ```bash
-# Chuẩn hoá Bronze -> Silver clean
-bash scripts/submit_yarn.sh silver/clean_hourly.py \
-    --start 2024-01-01T00:00:00 \
-    --end   2024-01-31T23:00:00
+# Chuẩn hoá Bronze -> Silver clean (YARN)
+bash scripts/run_spark.sh --mode yarn jobs/silver/clean_hourly.py \
+  --start 2024-01-01T00:00:00 \
+  --end   2024-01-31T23:00:00
 
-# Tính rolling components
-bash scripts/submit_yarn.sh silver/components_hourly.py \
-    --start 2024-01-01T00:00:00 \
-    --end   2024-01-31T23:00:00
+# Tính rolling components (YARN)
+bash scripts/run_spark.sh --mode yarn jobs/silver/components_hourly.py \
+  --start 2024-01-01T00:00:00 \
+  --end   2024-01-31T23:00:00
 
-# Tính AQI hourly
-bash scripts/submit_yarn.sh silver/index_hourly.py \
-    --start 2024-01-01T00:00:00 \
-    --end   2024-01-31T23:00:00
+# Tính AQI hourly (YARN)
+bash scripts/run_spark.sh --mode yarn jobs/silver/index_hourly.py \
+  --start 2024-01-01T00:00:00 \
+  --end   2024-01-31T23:00:00
 ```
 
 ### 4. Update incremental từ database hiện tại
 ```bash
 # Tự động detect từ MAX(ts) và update đến hiện tại
-bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
+bash scripts/run_spark.sh --mode yarn jobs/bronze/open_meteo_bronze.py \
     --locations configs/locations.json \
     --update-from-db \
     --yes \
@@ -255,10 +255,10 @@ Cập nhật `configs/locations.json`:
 Cập nhật `HOURLY_VARS` trong `jobs/ingest/open_meteo_bronze.py` và schema của bảng Bronze.
 
 ### 3. Scheduling
-Wrap `scripts/submit_yarn.sh` trong cron hoặc Airflow:
+Wrap `scripts/run_spark.sh --mode yarn` trong cron hoặc Airflow:
 ```bash
 # Cron example: chạy hàng giờ
-0 * * * * cd /path/to/dlh-aqi && bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py --locations configs/locations.json --update-from-db --yes --chunk-days 1
+0 * * * * cd /path/to/dlh-aqi && bash scripts/run_spark.sh --mode yarn jobs/bronze/open_meteo_bronze.py --locations configs/locations.json --update-from-db --yes --chunk-days 1
 ```
 
 ## Troubleshooting
@@ -332,7 +332,7 @@ The script captures the `RUN_ID` emitted by the ingest job and passes it to the 
 
 ## Ingestion job details
 
-`jobs/ingest/open_meteo_bronze.py` handles API access and Bronze writes (always submit via Spark/YARN using `script/submit_yarn.sh`).
+`jobs/bronze/open_meteo_bronze.py` handles API access and Bronze writes (submit via `scripts/run_spark.sh --mode yarn` in production).
 
 - Reads coordinates from `configs/locations.json` (keys are the `location_id`).
 - Uses a cached, retried Open-Meteo client with polite pacing (`time.sleep(0.2)` per API call).
@@ -366,7 +366,7 @@ Adding new KPIs (e.g., AQI calculations, rolling windows) follows the same patte
 ```
 jobs/ingest/open_meteo_bronze.py   # Bronze ingestion logic (MERGE + housekeeping)
 src/aq_lakehouse/spark_session.py  # Spark builder with Iceberg catalog config
-script/submit_yarn.sh              # Helper to submit arbitrary PySpark jobs to YARN
+scripts/run_spark.sh               # Unified helper to submit arbitrary PySpark jobs (yarn|standalone|local)
 scripts/run_pipeline.sh            # One-command pipeline orchestrator (spark-submit + housekeeping)
 scripts/reset_pipeline_state.sh    # Truncate/drop all layers and clear staging/cache files
 docs/ingest_bronze.md              # Detailed operations guide (this README's companion)

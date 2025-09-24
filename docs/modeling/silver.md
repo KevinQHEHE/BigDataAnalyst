@@ -36,6 +36,10 @@ This note documents the structure and assumptions behind the three Silver-layer 
   - `component_valid_flags` captures sufficiency flags (`pm25_24h_sufficient`, `o3_8h_sufficient`, etc.), a `continuous_hour` flag that verifies 1-hour spacing, and presence flags for NO2/SO2.
 - **Metadata** – `calc_method` defaults to `simple_rolling_v1`; adjust when experimenting with NowCast or alternative rules.
 
+Implementation notes
+- The components table's Iceberg table properties are tuned to produce smaller Parquet files for this intermediate layer: `write.target-file-size-bytes` is set to 33554432 (32MB). This reduces per-writer buffering and helps avoid large in-memory allocations during Parquet compression.
+- The `components_hourly` job includes a safeguard that repartitions the computed DataFrame when it would otherwise be written as a single partition. This forces parallel writers for the Iceberg MERGE and prevents single-task driver/worker writes that commonly trigger Java heap OOMs in local runs.
+
 ## Table: aq.silver.aq_index_hourly
 
 - **Purpose** – Provide final hourly AQI-style scores plus pollutant-specific sub-indices for reporting.
@@ -67,29 +71,85 @@ This note documents the structure and assumptions behind the three Silver-layer 
 
 Additional operational guidance (post optimization)
 
-- Prefer running the Silver pipeline with the repository wrappers so pre-staged libraries on HDFS are used and submission overhead is minimized. Use `scripts/run_silver_range.sh` to run the full Silver pipeline for a date range (it executes `clean_hourly` then `components_hourly` then `index_hourly` in the correct order unless flags restrict steps).
+Prefer running the Silver pipeline with the repository wrappers so pre-staged libraries on HDFS are used and submission overhead is minimized. Use `scripts/run_silver_range.sh` to run the full Silver pipeline for a date range (it executes `clean_hourly` then `components_hourly` then `index_hourly` in the correct order unless flags restrict steps).
 
-- For single-step runs or ad-hoc testing, use `scripts/submit_yarn.sh` which consumes `.env` to decide whether to use the experimental `SPARK_YARN_ARCHIVE` or the recommended `SPARK_YARN_JARS`/`SPARK_PYFILES` approach. Example:
+Silver v2 — Running the pipeline (updated)
+
+This project ships a unified submit helper and a range orchestration script. The recommended flow is:
+
+- Use `scripts/run_spark.sh` for single-step or ad-hoc runs. It accepts `--mode yarn|standalone|local` and resolves job paths under `jobs/` automatically.
+- Use `scripts/run_silver_range.sh` to run the full pipeline across a date range; it will chunk large ranges into multiple runs to avoid memory/OOM problems.
+
+Key flags and patterns:
+- `--spark-mode <yarn|standalone|local>`: passed to the range script to control how `run_spark.sh` launches Spark (default is `yarn`).
+- `--no-chunking`: force a single batch run for the full range (only for small ranges or testing).
+- `--chunk-months N`: set chunk size when the range is large (default: 6 months).
+- `--clean-only`, `--components-only`, `--index-only`: run individual steps.
+- `--dry-run`: show the exact `run_spark.sh` commands that would be executed without launching Spark (useful before a large run).
+
+Examples — local developer flow (copy/paste):
+
+1) Dry-run a small window on local (no Spark jobs will be started):
 
 ```bash
-# Full range run (preferred for large windows)
-bash scripts/run_silver_range.sh --start 2024-01-01T00:00:00 --end 2024-01-31T23:00:00
-
-# Run only clean step for a small window (ad-hoc)
-bash scripts/submit_yarn.sh silver/clean_hourly.py --start 2024-08-01T00:00:00 --end 2024-08-31T23:00:00 --mode replace
+bash scripts/run_silver_range.sh \
+  --start 2024-08-01T00:00:00 \
+  --end   2024-08-02T23:00:00 \
+  --spark-mode local \
+  --no-chunking \
+  --dry-run
 ```
 
-- Environment/config notes:
-  - Ensure `.env` contains `SPARK_YARN_JARS` and `SPARK_PYFILES` pointing at HDFS (e.g. `hdfs://khoa-master:9000/spark/jars/*` and `hdfs://khoa-master:9000/spark/python/pyspark.zip,...`). This allows the submit wrapper to avoid uploading hundreds of jars on every job.
-  - `SPARK_YARN_ARCHIVE` is supported but experimental; only set it if you purposely created a validated Spark distribution tarball on HDFS.
+2) Run the full pipeline locally for a small window:
 
-- Run ordering and idempotency:
-  - The wrapper scripts support `--mode replace` to remove existing Silver records for the window before writing. This is useful for deterministic reruns.
-  - When running the full range, the range script handles look-back for components (so you don't need to manage historical padding manually).
+```bash
+bash scripts/run_silver_range.sh \
+  --start 2024-08-01T00:00:00 \
+  --end   2024-08-02T23:00:00 \
+  --spark-mode local \
+  --no-chunking
+```
 
-- Validation and quick checks:
-  - After a run, open `notebooks/silver_validation.ipynb` or run the lightweight validation SQL in the notebook to verify row counts per `location_id` and date ranges.
-  - Monitor Spark submission logs; if you see many "Not copying" messages for `/spark/jars/` then the pre-staged approach worked correctly.
+3) Run only components step locally (fast iteration):
+
+```bash
+bash scripts/run_silver_range.sh \
+  --start 2024-08-01T00:00:00 \
+  --end   2024-08-02T23:00:00 \
+  --spark-mode local \
+  --components-only \
+  --no-chunking
+```
+
+4) Increase driver heap for local writes (if you encounter Java OOM during Parquet/Iceberg writes):
+
+```bash
+SPARK_DRIVER_MEMORY=12g bash scripts/run_silver_range.sh \
+  --start 2024-08-01T00:00:00 \
+  --end   2024-08-02T23:00:00 \
+  --spark-mode local \
+  --no-chunking
+```
+
+Chunking and safe defaults
+
+- The range script will automatically split large ranges into chunks (default 6 months). This prevents excessive memory pressure on a single Spark application.
+- Prefer chunking for long ranges. If you must run the entire range in a single local job, ensure `SPARK_DRIVER_MEMORY` is large and the range is small.
+
+Environment/config notes:
+
+- Ensure `.env` (when using YARN) contains `SPARK_YARN_JARS` and `SPARK_PYFILES` pointing at HDFS (e.g. `hdfs://khoa-master:9000/spark/jars/*` and `hdfs://khoa-master:9000/spark/python/pyspark.zip,...`) so the submit wrapper avoids uploading many jars on each job.
+- `SPARK_YARN_ARCHIVE` is supported but experimental; only set it if you validated a Spark tarball on HDFS.
+
+Run ordering and idempotency:
+
+- The wrapper scripts support `--mode replace` to remove existing Silver records for the window before writing. This is useful for deterministic reruns.
+- When running the full range, the range script handles look-back for components automatically.
+
+Validation and quick checks:
+
+- After a run, use `notebooks/silver_validation.ipynb` for row counts and null-ratio checks.
+- Use `--dry-run` on `run_silver_range.sh` to verify the exact `run_spark.sh` commands that will be issued before launching heavy jobs.
 
 ## Troubleshooting Common Issues
 
@@ -122,6 +182,9 @@ bash scripts/submit_yarn.sh silver/clean_hourly.py --start 2024-08-01T00:00:00 -
    SPARK_EXECUTOR_MEMORY_OVERHEAD=512m
    SPARK_DRIVER_MEMORY=1g
    YARN_MAX_ALLOCATION_MB=4096
+
+Additional local-run guidance
+- For local mode (developer testing) where writes are performed on the driver JVM, increase `SPARK_DRIVER_MEMORY` (for example to `6g` or `12g`) and increase `SPARK_SQL_SHUFFLE_PARTITIONS` (for example to `200`) in `.env` to spread write work across more parallel tasks and give each JVM enough heap. Also consider lowering `SPARK_MAX_PARTITION_BYTES` (e.g., to 16MB) to limit per-task file sizes.
    ```
 
 3. **Incremental Processing**: Process smaller date ranges sequentially:

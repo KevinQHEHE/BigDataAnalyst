@@ -32,6 +32,8 @@ INDEX_ONLY=false
 CHUNK_MONTHS=6
 NO_CHUNKING=false
 DRY_RUN=false
+SPARK_MODE="yarn"
+MASTER_URL=""
 
 show_usage() {
   head -n 20 "$0" | tail -n +3 | sed 's/^# //'
@@ -69,6 +71,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --chunk-months)
       CHUNK_MONTHS="$2"
+      shift 2
+      ;;
+    --spark-mode)
+      SPARK_MODE="$2"
+      shift 2
+      ;;
+    --master-url)
+      MASTER_URL="$2"
       shift 2
       ;;
     --no-chunking)
@@ -171,27 +181,27 @@ process_chunk() {
   if [[ "$RUN_CLEAN" == true ]]; then
     echo "=> Chunk $chunk_num/$total_chunks: Clean hourly data"
     if [[ "$DRY_RUN" == true ]]; then
-      echo "   [DRY-RUN] Would run: bash scripts/submit_yarn.sh silver/clean_hourly.py ${chunk_args[*]}"
+      echo "   [DRY-RUN] Would run: bash scripts/run_spark.sh --mode ${SPARK_MODE} ${MASTER_URL:+--master-url $MASTER_URL} jobs/silver/clean_hourly.py ${chunk_args[*]}"
     else
-      bash "$ROOT_DIR/scripts/submit_yarn.sh" silver/clean_hourly.py "${chunk_args[@]}"
+      bash "$ROOT_DIR/scripts/run_spark.sh" --mode "${SPARK_MODE}" ${MASTER_URL:+--master-url "$MASTER_URL"} silver/clean_hourly.py "${chunk_args[@]}"
     fi
   fi
 
   if [[ "$RUN_COMPONENTS" == true ]]; then
     echo "=> Chunk $chunk_num/$total_chunks: Compute components"
     if [[ "$DRY_RUN" == true ]]; then
-      echo "   [DRY-RUN] Would run: bash scripts/submit_yarn.sh silver/components_hourly.py ${chunk_args[*]}"
+      echo "   [DRY-RUN] Would run: bash scripts/run_spark.sh --mode ${SPARK_MODE} ${MASTER_URL:+--master-url $MASTER_URL} jobs/silver/components_hourly.py ${chunk_args[*]}"
     else
-      bash "$ROOT_DIR/scripts/submit_yarn.sh" silver/components_hourly.py "${chunk_args[@]}"
+      bash "$ROOT_DIR/scripts/run_spark.sh" --mode "${SPARK_MODE}" ${MASTER_URL:+--master-url "$MASTER_URL"} silver/components_hourly.py "${chunk_args[@]}"
     fi
   fi
 
   if [[ "$RUN_INDEX" == true ]]; then
     echo "=> Chunk $chunk_num/$total_chunks: Compute AQI index"
     if [[ "$DRY_RUN" == true ]]; then
-      echo "   [DRY-RUN] Would run: bash scripts/submit_yarn.sh silver/index_hourly.py ${chunk_args[*]}"
+      echo "   [DRY-RUN] Would run: bash scripts/run_spark.sh --mode ${SPARK_MODE} ${MASTER_URL:+--master-url $MASTER_URL} jobs/silver/index_hourly.py ${chunk_args[*]}"
     else
-      bash "$ROOT_DIR/scripts/submit_yarn.sh" silver/index_hourly.py "${chunk_args[@]}"
+      bash "$ROOT_DIR/scripts/run_spark.sh" --mode "${SPARK_MODE}" ${MASTER_URL:+--master-url "$MASTER_URL"} silver/index_hourly.py "${chunk_args[@]}"
     fi
   fi
   
@@ -283,9 +293,9 @@ fi
 if [[ "$RUN_CLEAN" == true ]]; then
   echo "=> Step 1: Clean hourly data"
   if [[ "$DRY_RUN" == true ]]; then
-    echo "   [DRY-RUN] Would run: bash scripts/submit_yarn.sh silver/clean_hourly.py ${COMMON_ARGS[*]}"
+    echo "   [DRY-RUN] Would run: bash scripts/run_spark.sh --mode ${SPARK_MODE} ${MASTER_URL:+--master-url $MASTER_URL} silver/clean_hourly.py ${COMMON_ARGS[*]}"
   else
-    bash "$ROOT_DIR/scripts/submit_yarn.sh" silver/clean_hourly.py "${COMMON_ARGS[@]}"
+    bash "$ROOT_DIR/scripts/run_spark.sh" --mode "${SPARK_MODE}" ${MASTER_URL:+--master-url "$MASTER_URL"} silver/clean_hourly.py "${COMMON_ARGS[@]}"
   fi
   echo "=> Clean step completed"
 fi
@@ -293,9 +303,9 @@ fi
 if [[ "$RUN_COMPONENTS" == true ]]; then
   echo "=> Step 2: Compute components"
   if [[ "$DRY_RUN" == true ]]; then
-    echo "   [DRY-RUN] Would run: bash scripts/submit_yarn.sh silver/components_hourly.py ${COMMON_ARGS[*]}"
+    echo "   [DRY-RUN] Would run: bash scripts/run_spark.sh --mode ${SPARK_MODE} ${MASTER_URL:+--master-url $MASTER_URL} silver/components_hourly.py ${COMMON_ARGS[*]}"
   else
-    bash "$ROOT_DIR/scripts/submit_yarn.sh" silver/components_hourly.py "${COMMON_ARGS[@]}"
+    bash "$ROOT_DIR/scripts/run_spark.sh" --mode "${SPARK_MODE}" ${MASTER_URL:+--master-url "$MASTER_URL"} silver/components_hourly.py "${COMMON_ARGS[@]}"
   fi
   echo "=> Components step completed"
 fi
@@ -303,9 +313,9 @@ fi
 if [[ "$RUN_INDEX" == true ]]; then
   echo "=> Step 3: Compute AQI index"
   if [[ "$DRY_RUN" == true ]]; then
-    echo "   [DRY-RUN] Would run: bash scripts/submit_yarn.sh silver/index_hourly.py ${COMMON_ARGS[*]}"
+    echo "   [DRY-RUN] Would run: bash scripts/run_spark.sh --mode ${SPARK_MODE} ${MASTER_URL:+--master-url $MASTER_URL} silver/index_hourly.py ${COMMON_ARGS[*]}"
   else
-    bash "$ROOT_DIR/scripts/submit_yarn.sh" silver/index_hourly.py "${COMMON_ARGS[@]}"
+    bash "$ROOT_DIR/scripts/run_spark.sh" --mode "${SPARK_MODE}" ${MASTER_URL:+--master-url "$MASTER_URL"} silver/index_hourly.py "${COMMON_ARGS[@]}"
   fi
   echo "=> Index step completed"
 fi

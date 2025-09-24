@@ -71,7 +71,7 @@ def ensure_table(spark) -> None:
         """
         ALTER TABLE hadoop_catalog.aq.silver.aq_components_hourly SET TBLPROPERTIES (
           'format-version'='2',
-          'write.target-file-size-bytes'='134217728',
+                    'write.target-file-size-bytes'='33554432',
           'write.distribution-mode'='hash'
         )
         """
@@ -253,6 +253,17 @@ def main() -> None:
 
         if args.mode == "replace":
             delete_existing(spark, start_ts, end_ts, args.location_ids)
+
+        # Ensure the DataFrame is partitioned so Iceberg/Parquet writers run in parallel
+        try:
+            shuffle_partitions = int(spark.conf.get("spark.sql.shuffle.partitions", "200"))
+        except Exception:
+            shuffle_partitions = spark.sparkContext.defaultParallelism or 200
+
+        num_partitions = df_components.rdd.getNumPartitions()
+        if num_partitions <= 1:
+            logging.info("Repartitioning components DataFrame from %d -> %d partitions to parallelize writes", num_partitions, shuffle_partitions)
+            df_components = df_components.repartition(shuffle_partitions)
 
         write_to_table(spark, df_components)
 

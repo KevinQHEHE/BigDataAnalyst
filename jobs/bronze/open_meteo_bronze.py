@@ -169,7 +169,7 @@ def run_housekeeping(spark):
         """
         CALL hadoop_catalog.system.rewrite_data_files(
           'aq.bronze.raw_open_meteo_hourly',
-          map('target-file-size-bytes', CAST(134217728 AS bigint))
+                    map('target-file-size-bytes', '134217728')
         )
         """,
         """
@@ -316,7 +316,8 @@ def main():
             WHEN MATCHED THEN UPDATE SET *
             WHEN NOT MATCHED THEN INSERT *
             """
-            logging.info("Merging %s rows into Bronze (temp view=%s)", df.count(), temp_view)
+            # Avoid full count() which is expensive for many small chunks; prefer caller-provided estimate
+            logging.info("Merging into Bronze (temp view=%s)", temp_view)
             spark_session.sql(merge_sql)
             spark_session.catalog.dropTempView(temp_view)
 
@@ -366,6 +367,7 @@ def main():
                         df_chunk = df_chunk.dropDuplicates(["location_id", "ts"])
 
                         run_tag = f"raw_{run_id.replace('-', '_')}_{loc_idx}_{chunk_idx}"
+                        # Pass len(chunk_rows) as an estimate so we don't call df.count()
                         merge_df_into_bronze(spark, df_chunk, run_tag)
                         total_rows += len(chunk_rows)
                         chunk_idx += 1
@@ -377,7 +379,13 @@ def main():
             logging.info("No rows fetched from Open-Meteo; nothing to write")
             return
 
-        run_housekeeping(spark)
+        # Skip expensive Iceberg housekeeping on local runs unless explicitly enabled
+        is_local_master = spark.sparkContext.master.startswith("local")
+        enable_hk = os.environ.get("ENABLE_HOUSEKEEPING", "0") == "1"
+        if is_local_master and not enable_hk:
+            logging.info("Skipping Iceberg housekeeping on local master; set ENABLE_HOUSEKEEPING=1 to enable")
+        else:
+            run_housekeeping(spark)
 
         spark.sql(
             """
