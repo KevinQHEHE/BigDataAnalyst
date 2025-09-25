@@ -27,7 +27,7 @@ windows=(
 for window in "${windows[@]}"; do
   read start end <<<"$window"
   echo "=> Running index job for $start -> $end"
-  bash scripts/submit_yarn.sh silver/index_hourly.py \
+  bash scripts/run_spark.sh --mode yarn jobs/silver/index_hourly.py \
     --start "$start" \
     --end   "$end"
   echo "=> Finished: $start -> $end"

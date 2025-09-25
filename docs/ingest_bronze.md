@@ -93,8 +93,9 @@ Note: The ingest job reads locations from the JSON file you supply via `--locati
 ### 1. Ingest dữ liệu cho range thời gian cụ thể
 
 ```bash
-# Ingest dữ liệu từ 2024-01-01 đến 2024-01-31, chia chunk 10 ngày
-bash scripts/submit_yarn.sh bronze/open_meteo_bronze.py \
+# Ingest dữ liệu từ 2024-01-01 đến 2024-01-31, chia chunk 10 ngày (YARN)
+# Uses the unified submit helper `scripts/run_spark.sh` which accepts --mode (yarn|standalone|local)
+bash scripts/run_spark.sh --mode yarn jobs/bronze/open_meteo_bronze.py \
   --locations configs/locations.json \
   --start 2024-01-01 --end 2024-01-31 \
   --chunk-days 10
@@ -103,9 +104,9 @@ bash scripts/submit_yarn.sh bronze/open_meteo_bronze.py \
 ### 2. Update incremental từ database
 
 ```bash
-# Update từ thời điểm mới nhất trong DB đến hiện tại
+# Update từ thời điểm mới nhất trong DB đến hiện tại (YARN)
 # Nếu DB trống, sẽ hỏi có muốn backfill từ 2023-01-01 không
-bash scripts/submit_yarn.sh bronze/open_meteo_bronze.py \
+bash scripts/run_spark.sh --mode yarn jobs/bronze/open_meteo_bronze.py \
   --locations configs/locations.json \
   --update-from-db \
   --chunk-days 10
@@ -114,8 +115,8 @@ bash scripts/submit_yarn.sh bronze/open_meteo_bronze.py \
 ### 3. Backfill tự động (non-interactive)
 
 ```bash
-# Backfill tự động từ 2023-01-01 nếu DB trống, hoặc update từ MAX(ts)
-bash scripts/submit_yarn.sh bronze/open_meteo_bronze.py \
+# Backfill tự động từ 2023-01-01 nếu DB trống, hoặc update từ MAX(ts) (YARN)
+bash scripts/run_spark.sh --mode yarn jobs/bronze/open_meteo_bronze.py \
   --locations configs/locations.json \
   --update-from-db \
   --yes \
@@ -131,8 +132,8 @@ To limit which locations are ingested, edit `configs/locations.json` to include 
 Example: create a small `configs/locations_small.json` containing only the desired entries and point the job to it:
 
 ```bash
-# Ingest only a reduced set of locations defined in configs/locations_small.json
-bash scripts/submit_yarn.sh bronze/open_meteo_bronze.py \
+# Ingest only a reduced set of locations defined in configs/locations_small.json (local fast loop)
+bash scripts/run_spark.sh --mode local jobs/bronze/open_meteo_bronze.py \
   --locations configs/locations_small.json \
   --start 2024-01-01 --end 2024-01-31 \
   --chunk-days 10
@@ -141,8 +142,8 @@ bash scripts/submit_yarn.sh bronze/open_meteo_bronze.py \
 ### 5. Replace range (ingest lại dữ liệu)
 
 ```bash
-# Xóa và ingest lại dữ liệu trong range
-bash scripts/submit_yarn.sh bronze/open_meteo_bronze.py \
+# Xóa và ingest lại dữ liệu trong range (YARN)
+bash scripts/run_spark.sh --mode yarn jobs/bronze/open_meteo_bronze.py \
     --locations configs/locations.json \
   --start 2024-01-01 \
   --end 2024-01-07 \
@@ -331,6 +332,8 @@ rm -rf spark-warehouse/
 - **Partitioning**: Bảng được partition theo `days(ts)` 
 - **File size**: Target 128MB per file
 - **Compaction**: Tự động chạy sau mỗi ingest
+
+Note: Some Silver-layer tables (notably `aq.silver.aq_components_hourly`) were adjusted in code to target smaller Parquet files (32MB) and the components job now repartitions the DataFrame before performing the Iceberg MERGE to avoid single-task driver writes during local runs. If you experience OOM during Iceberg writes, consider increasing `SPARK_DRIVER_MEMORY` and `SPARK_SQL_SHUFFLE_PARTITIONS` in `.env` or run the job on a Yarn/standalone cluster.
 
 ## Quy trình dọn dẹp hệ thống (WSL2/Docker Desktop)
 

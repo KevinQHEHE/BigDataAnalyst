@@ -29,9 +29,10 @@ applyTo: '**'
 
 ## Hard Rules (must follow)
 
-**Always target distributed mode**:
-- Default to YARN. Do not set `.master("local[*]")` or use standalone in production code
-- If you must include a local example for tests, keep it isolated under `tests/` or as a commented snippet, never the default path
+**Target mode guidance (production vs development)**:
+- Prefer YARN for production jobs. Do not set `.master("local[*]")` in production code.
+- Local or standalone Spark is allowed for development, debugging, and unit tests. When using local/standalone, keep examples isolated (for example under `tests/`) or clearly marked as developer-only. Avoid shipping `.master("local[*]")` in production modules.
+- Use the repository submit helper `scripts/run_spark.sh --mode <yarn|standalone|local>` to run in the desired mode; examples appear in the "Job Submission & Runtime" section below.
 
 **Use the existing Spark/Iceberg wiring**:
 - Assume the runtime provides Iceberg jars; don't add new ones or switch to Delta/LakeFS/etc
@@ -93,7 +94,7 @@ WAREHOUSE_URI = os.getenv("WAREHOUSE_URI", "hdfs://khoa-master:9000/warehouse/ic
 def build(app_name: str) -> SparkSession:
     return (
         SparkSession.builder.appName(app_name)
-        # Do NOT set .master("local")
+        # Do NOT set .master("local") in production. For development or local testing use the local snippet shown below.
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
         .config("spark.sql.catalog.hadoop_catalog", "org.apache.iceberg.spark.SparkCatalog") 
         .config("spark.sql.catalog.hadoop_catalog.type", "hadoop")
@@ -143,15 +144,15 @@ def build(app_name: str) -> SparkSession:
 
 **Use existing submit script**:
 ```bash
-# Example: Ingest data for date range
-bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
+# Example: Ingest data for date range (YARN)
+bash scripts/run_spark.sh --mode yarn jobs/bronze/open_meteo_bronze.py \
     --locations configs/locations.json \
     --start-date 2024-01-01 \
     --end-date 2024-01-31 \
     --chunk-days 10
 
 # Example: Update from database (incremental)  
-bash scripts/submit_yarn.sh ingest/open_meteo_bronze.py \
+bash scripts/run_spark.sh --mode yarn jobs/bronze/open_meteo_bronze.py \
     --locations configs/locations.json \
     --update-from-db
 ```

@@ -63,8 +63,8 @@ This repository provides `scripts/submit_yarn.sh` and `scripts/run_silver_range.
 # Single run for a date range (clean -> components -> index if using the range script)
 bash scripts/run_silver_range.sh --start 2024-01-01T00:00:00 --end 2024-01-31T23:00:00
 
-# Submit a single job directly (clean step)
-bash scripts/submit_yarn.sh silver/clean_hourly.py --start 2024-08-01T00:00:00 --end 2024-08-31T23:00:00
+# Submit a single job directly (clean step) on YARN
+bash scripts/run_spark.sh --mode yarn jobs/silver/clean_hourly.py --start 2024-08-01T00:00:00 --end 2024-08-31T23:00:00
 ```
 
 The wrapper will prefer `SPARK_YARN_ARCHIVE` when set (experimental), otherwise it assembles `--conf spark.yarn.jars=...` and `--py-files` from `SPARK_YARN_JARS` and `SPARK_PYFILES`.
