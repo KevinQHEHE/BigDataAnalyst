@@ -11,7 +11,6 @@ SILVER_CLEAN_TABLE = "hadoop_catalog.aq.silver.air_quality_hourly_clean"
 SILVER_COMPONENT_TABLE = "hadoop_catalog.aq.silver.aq_components_hourly"
 SILVER_INDEX_TABLE = "hadoop_catalog.aq.silver.aq_index_hourly"
 DIM_LOCATION_TABLE = "hadoop_catalog.aq.gold.dim_location"
-DIM_CALENDAR_TABLE = "hadoop_catalog.aq.gold.dim_calendar_hour"
 FACT_TABLE = "hadoop_catalog.aq.gold.fact_air_quality_hourly"
 
 
@@ -62,7 +61,8 @@ def ensure_table(spark) -> None:
         f"""
         CREATE TABLE IF NOT EXISTS {FACT_TABLE} (
           location_key STRING,
-          calendar_hour_key STRING,
+          date_key STRING,
+          time_key STRING,
           ts_utc TIMESTAMP,
           date_utc DATE,
           pm25 DOUBLE,
@@ -75,6 +75,7 @@ def ensure_table(spark) -> None:
           uv_index DOUBLE,
           uv_index_clear_sky DOUBLE,
           pm25_24h_avg DOUBLE,
+          pm10_24h_avg DOUBLE,
           pm25_nowcast DOUBLE,
           o3_8h_max DOUBLE,
           no2_1h_max DOUBLE,
@@ -106,6 +107,15 @@ def ensure_table(spark) -> None:
         )
         """
     )
+
+    if spark.catalog.tableExists(FACT_TABLE):
+        field_names = {field.name for field in spark.table(FACT_TABLE).schema.fields}
+        if "calendar_hour_key" in field_names:
+            spark.sql(f"ALTER TABLE {FACT_TABLE} DROP COLUMN calendar_hour_key")
+            field_names.remove("calendar_hour_key")
+        for column_name, column_type in [("date_key", "STRING"), ("time_key", "STRING"), ("pm10_24h_avg", "DOUBLE")]:
+            if column_name not in field_names:
+                spark.sql(f"ALTER TABLE {FACT_TABLE} ADD COLUMN {column_name} {column_type}")
 
 
 def current_max_fact_ts(spark) -> Optional[datetime]:
@@ -274,9 +284,6 @@ def build_dataframe(
     location_dim = spark.table(DIM_LOCATION_TABLE).select("location_key").alias("loc")
     fact_stage = fact_stage.join(location_dim, F.col("c.location_id") == F.col("loc.location_key"), "inner")
 
-    calendar_dim = spark.table(DIM_CALENDAR_TABLE).select("calendar_hour_key", "ts_utc").alias("cal")
-    fact_stage = fact_stage.join(calendar_dim, F.col("c.ts_utc") == F.col("cal.ts_utc"), "inner")
-
     is_validated, quality_flag = compute_quality(F.col("c.valid_flags"), quality_threshold)
 
     computed_at = F.greatest(
@@ -292,7 +299,8 @@ def build_dataframe(
         fact_stage
         .select(
             F.col("loc.location_key").alias("location_key"),
-            F.col("cal.calendar_hour_key").alias("calendar_hour_key"),
+            F.date_format(F.col("c.date_utc"), "yyyyMMdd").alias("date_key"),
+            F.date_format(F.col("c.ts_utc"), "HH").alias("time_key"),
             F.col("c.ts_utc"),
             F.col("c.date_utc"),
             F.col("c.pm25"),
@@ -305,6 +313,7 @@ def build_dataframe(
             F.col("c.uv_index"),
             F.col("c.uv_index_clear_sky"),
             F.col("cmp.pm25_24h_avg"),
+            F.col("cmp.pm10_24h_avg"),
             pm25_nowcast.alias("pm25_nowcast"),
             F.col("cmp.o3_8h_max"),
             F.col("cmp.no2_1h_max"),
@@ -326,12 +335,12 @@ def build_dataframe(
         )
     )
 
-    return result.dropDuplicates(["location_key", "calendar_hour_key"]).repartition("location_key", "date_utc")
+    return result.dropDuplicates(["location_key", "date_key", "time_key"]).repartition("location_key", "date_key")
 
 
 def upsert_fact(spark, df: DataFrame) -> None:
-    partition_cols = ["location_key", "date_utc"]
-    key_cols = ["location_key", "calendar_hour_key"]
+    partition_cols = ["location_key", "date_key"]
+    key_cols = ["location_key", "date_key", "time_key"]
 
     affected_partitions = df.select(*partition_cols).distinct()
 
@@ -362,7 +371,7 @@ def upsert_fact(spark, df: DataFrame) -> None:
         .withColumn("_rn", F.row_number().over(window))
         .where(F.col("_rn") == 1)
         .drop("_rn", "_priority")
-        .repartition("location_key", "date_utc")
+        .repartition("location_key", "date_key")
     )
 
     deduped.writeTo(FACT_TABLE).overwritePartitions()

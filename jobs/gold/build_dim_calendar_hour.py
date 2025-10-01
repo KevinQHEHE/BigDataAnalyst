@@ -8,7 +8,8 @@ from pyspark.sql import DataFrame, functions as F, types as T
 from aq_lakehouse.spark_session import build
 
 SILVER_TABLE = "hadoop_catalog.aq.silver.air_quality_hourly_clean"
-DIM_CALENDAR_TABLE = "hadoop_catalog.aq.gold.dim_calendar_hour"
+DIM_DATE_TABLE = "hadoop_catalog.aq.gold.dim_calendar_date"
+DIM_TIME_TABLE = "hadoop_catalog.aq.gold.dim_calendar_time"
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,7 +33,7 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         choices=["merge", "replace"],
         default="merge",
-        help="replace deletes calendar rows in the requested range before merge",
+        help="replace recomputes the requested window regardless of existing rows",
     )
     return parser.parse_args()
 
@@ -46,18 +47,16 @@ def parse_iso_ts(value: Optional[str]) -> Optional[datetime]:
     return ts.astimezone(timezone.utc)
 
 
-def ensure_table(spark) -> None:
+def ensure_tables(spark) -> None:
     spark.sql("CREATE NAMESPACE IF NOT EXISTS hadoop_catalog.aq.gold")
     spark.sql(
         f"""
-        CREATE TABLE IF NOT EXISTS {DIM_CALENDAR_TABLE} (
-          calendar_hour_key STRING,
-          ts_utc TIMESTAMP,
+        CREATE TABLE IF NOT EXISTS {DIM_DATE_TABLE} (
+          date_key STRING,
           date_utc DATE,
           year INT,
           month INT,
           day INT,
-          hour INT,
           dow INT,
           week INT,
           is_weekend BOOLEAN,
@@ -67,11 +66,36 @@ def ensure_table(spark) -> None:
           created_at TIMESTAMP,
           updated_at TIMESTAMP
         ) USING iceberg
+        PARTITIONED BY (years(date_utc))
         """
     )
     spark.sql(
         f"""
-        ALTER TABLE {DIM_CALENDAR_TABLE} SET TBLPROPERTIES (
+        ALTER TABLE {DIM_DATE_TABLE} SET TBLPROPERTIES (
+          'format-version'='2',
+          'write.target-file-size-bytes'='33554432',
+          'write.distribution-mode'='hash'
+        )
+        """
+    )
+
+    spark.sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS {DIM_TIME_TABLE} (
+          time_key STRING,
+          hour INT,
+          hour_label STRING,
+          is_am BOOLEAN,
+          day_part STRING,
+          created_at TIMESTAMP,
+          updated_at TIMESTAMP
+        ) USING iceberg
+        PARTITIONED BY (hour)
+        """
+    )
+    spark.sql(
+        f"""
+        ALTER TABLE {DIM_TIME_TABLE} SET TBLPROPERTIES (
           'format-version'='2',
           'write.target-file-size-bytes'='33554432',
           'write.distribution-mode'='hash'
@@ -80,25 +104,15 @@ def ensure_table(spark) -> None:
     )
 
 
-def current_max_calendar_hour(spark) -> Optional[datetime]:
-    if not spark.catalog.tableExists(DIM_CALENDAR_TABLE):
+def current_max_date_start(spark) -> Optional[datetime]:
+    if not spark.catalog.tableExists(DIM_DATE_TABLE):
         return None
 
-    row = (
-        spark.table(DIM_CALENDAR_TABLE)
-        .agg(F.max("ts_utc").alias("max_ts"))
-        .first()
-    )
-    if not row:
+    row = spark.table(DIM_DATE_TABLE).agg(F.max("date_utc").alias("max_date")).first()
+    if not row or row["max_date"] is None:
         return None
 
-    max_ts = row["max_ts"]
-    if max_ts is None:
-        return None
-
-    if max_ts.tzinfo is None:
-        return max_ts.replace(tzinfo=timezone.utc)
-    return max_ts.astimezone(timezone.utc)
+    return datetime.combine(row["max_date"], datetime.min.time(), tzinfo=timezone.utc)
 
 
 def derive_window(
@@ -114,7 +128,7 @@ def derive_window(
 
     agg = df.agg(F.min("ts_utc").alias("min_ts"), F.max("ts_utc").alias("max_ts")).first()
     if not agg or agg["min_ts"] is None or agg["max_ts"] is None:
-        logging.info("No timestamps found in Silver; skipping dim_calendar_hour")
+        logging.info("No timestamps found in Silver; skipping calendar build")
         return None
 
     min_ts = agg["min_ts"]
@@ -133,21 +147,21 @@ def derive_window(
     window_end = min(max_ts, end_ts) if end_ts else max_ts
 
     if mode == "merge" and start_ts is None:
-        latest_calendar_ts = current_max_calendar_hour(spark)
-        if latest_calendar_ts is not None:
-            next_hour = latest_calendar_ts + timedelta(hours=1)
-            if next_hour > window_end:
+        latest_date_start = current_max_date_start(spark)
+        if latest_date_start is not None:
+            next_day_start = latest_date_start + timedelta(days=1)
+            if next_day_start > window_end:
                 logging.info(
-                    "No new dim_calendar_hour rows detected (latest existing=%s, window_end=%s)",
-                    latest_calendar_ts,
+                    "No new calendar rows detected (latest existing date=%s, window_end=%s)",
+                    latest_date_start,
                     window_end,
                 )
                 return None
-            window_start = max(window_start, next_hour)
+            window_start = max(window_start, next_day_start)
 
     if window_start > window_end:
         logging.info(
-            "Window empty after filters (start=%s, end=%s)",
+            "Calendar window empty after filters (start=%s, end=%s)",
             window_start,
             window_end,
         )
@@ -156,7 +170,7 @@ def derive_window(
     return window_start, window_end
 
 
-def build_dataframe(spark, window_start: datetime, window_end: datetime) -> DataFrame:
+def build_hours_dataframe(spark, window_start: datetime, window_end: datetime) -> DataFrame:
     start_ts = window_start.replace(tzinfo=None)
     end_ts = window_end.replace(tzinfo=None)
 
@@ -166,125 +180,88 @@ def build_dataframe(spark, window_start: datetime, window_end: datetime) -> Data
     ])
 
     window_df = spark.createDataFrame([(start_ts, end_ts)], schema)
-    hours_df = window_df.select(
+    return window_df.select(
         F.explode(F.sequence("start_ts", "end_ts", F.expr("INTERVAL 1 HOUR"))).alias("ts_utc")
     )
 
+
+def build_date_dimension(hours_df: DataFrame) -> DataFrame:
     current_ts = F.current_timestamp()
-    derived = hours_df.withColumn("calendar_hour_key", F.date_format("ts_utc", "yyyyMMddHH"))
-    derived = derived.withColumn("date_utc", F.to_date("ts_utc"))
-    derived = derived.withColumn("year", F.year("ts_utc"))
-    derived = derived.withColumn("month", F.month("ts_utc"))
-    derived = derived.withColumn("day", F.dayofmonth("ts_utc"))
-    derived = derived.withColumn("hour", F.hour("ts_utc"))
-    dow_sunday_one = F.dayofweek("ts_utc")
+    base = hours_df.select(F.to_date("ts_utc").alias("date_utc")).dropDuplicates(["date_utc"])
+
+    dow_sunday_one = F.dayofweek("date_utc")
     dow_iso = F.when(dow_sunday_one == 1, F.lit(7)).otherwise(dow_sunday_one - 1)
-    derived = derived.withColumn("dow", dow_iso.cast("int"))
-    derived = derived.withColumn("week", F.weekofyear("ts_utc"))
-    derived = derived.withColumn("is_weekend", F.col("dow").isin(6, 7))
-    derived = derived.withColumn("quarter", F.quarter("ts_utc"))
-    derived = derived.withColumn("month_name", F.date_format("ts_utc", "MMMM"))
-    derived = derived.withColumn("day_name", F.date_format("ts_utc", "EEEE"))
 
     return (
-        derived
+        base
+        .withColumn("date_key", F.date_format("date_utc", "yyyyMMdd"))
+        .withColumn("year", F.year("date_utc"))
+        .withColumn("month", F.month("date_utc"))
+        .withColumn("day", F.dayofmonth("date_utc"))
+        .withColumn("dow", dow_iso.cast("int"))
+        .withColumn("week", F.weekofyear("date_utc"))
+        .withColumn("is_weekend", F.col("dow").isin(6, 7))
+        .withColumn("quarter", F.quarter("date_utc"))
+        .withColumn("month_name", F.date_format("date_utc", "MMMM"))
+        .withColumn("day_name", F.date_format("date_utc", "EEEE"))
+        .withColumn("created_at", current_ts)
+        .withColumn("updated_at", current_ts)
         .select(
-            "calendar_hour_key",
-            "ts_utc",
+            "date_key",
             "date_utc",
             "year",
             "month",
             "day",
-            "hour",
             "dow",
             "week",
             "is_weekend",
             "quarter",
             "month_name",
             "day_name",
+            "created_at",
+            "updated_at",
+        )
+    )
+
+
+def build_time_dimension(hours_df: DataFrame) -> DataFrame:
+    current_ts = F.current_timestamp()
+    return (
+        hours_df
+        .select(F.hour("ts_utc").alias("hour"))
+        .dropDuplicates(["hour"])
+        .withColumn("time_key", F.format_string("%02d", F.col("hour")))
+        .withColumn("hour_label", F.format_string("%02d:00", F.col("hour")))
+        .withColumn("is_am", F.col("hour") < 12)
+        .withColumn(
+            "day_part",
+            F.when(F.col("hour") < 6, F.lit("Night"))
+            .when(F.col("hour") < 12, F.lit("Morning"))
+            .when(F.col("hour") < 18, F.lit("Afternoon"))
+            .otherwise(F.lit("Evening")),
         )
         .withColumn("created_at", current_ts)
         .withColumn("updated_at", current_ts)
+        .select("time_key", "hour", "hour_label", "is_am", "day_part", "created_at", "updated_at")
     )
 
 
-def delete_range(spark, start_ts: datetime, end_ts: datetime) -> None:
-    start_literal = start_ts.strftime("%Y-%m-%d %H:%M:%S")
-    end_literal = end_ts.strftime("%Y-%m-%d %H:%M:%S")
-    logging.info(
-        "Deleting dim_calendar_hour rows where ts_utc BETWEEN %s AND %s",
-        start_literal,
-        end_literal,
-    )
-    spark.sql(
-        f"""
-        DELETE FROM {DIM_CALENDAR_TABLE}
-        WHERE ts_utc >= TIMESTAMP '{start_literal}'
-          AND ts_utc <= TIMESTAMP '{end_literal}'
-        """
-    )
+def write_dates(spark, df: DataFrame) -> None:
+    sample = df.limit(1).collect()
+    if not sample:
+        logging.info("No calendar dates to write")
+        return
+    df.writeTo(DIM_DATE_TABLE).overwritePartitions()
+    logging.info("Upserted %d calendar date rows", df.count())
 
 
-def merge_dimension(spark, df: DataFrame) -> None:
-    temp_view = "tmp_dim_calendar_merge"
-    df.createOrReplaceTempView(temp_view)
-    try:
-        spark.sql(
-            f"""
-            MERGE INTO {DIM_CALENDAR_TABLE} t
-            USING {temp_view} s
-            ON t.calendar_hour_key = s.calendar_hour_key
-            WHEN MATCHED THEN UPDATE SET
-              ts_utc = s.ts_utc,
-              date_utc = s.date_utc,
-              year = s.year,
-              month = s.month,
-              day = s.day,
-              hour = s.hour,
-              dow = s.dow,
-              week = s.week,
-              is_weekend = s.is_weekend,
-              quarter = s.quarter,
-              month_name = s.month_name,
-              day_name = s.day_name,
-              updated_at = s.updated_at
-            WHEN NOT MATCHED THEN INSERT (
-              calendar_hour_key,
-              ts_utc,
-              date_utc,
-              year,
-              month,
-              day,
-              hour,
-              dow,
-              week,
-              is_weekend,
-              quarter,
-              month_name,
-              day_name,
-              created_at,
-              updated_at
-            ) VALUES (
-              s.calendar_hour_key,
-              s.ts_utc,
-              s.date_utc,
-              s.year,
-              s.month,
-              s.day,
-              s.hour,
-              s.dow,
-              s.week,
-              s.is_weekend,
-              s.quarter,
-              s.month_name,
-              s.day_name,
-              s.created_at,
-              s.updated_at
-            )
-            """
-        )
-    finally:
-        spark.catalog.dropTempView(temp_view)
+def write_times(spark, df: DataFrame) -> None:
+    sample = df.limit(1).collect()
+    if not sample:
+        logging.info("No calendar times to write")
+        return
+    df.writeTo(DIM_TIME_TABLE).overwritePartitions()
+    logging.info("Upserted %d calendar time rows", df.count())
 
 
 def main() -> None:
@@ -294,31 +271,28 @@ def main() -> None:
     start_ts = parse_iso_ts(args.start)
     end_ts = parse_iso_ts(args.end)
 
-    spark = build("gold_dim_calendar_hour")
+    spark = build("gold_dim_calendar")
     spark.conf.set("spark.sql.session.timeZone", "UTC")
 
     try:
-        ensure_table(spark)
+        ensure_tables(spark)
 
         window = derive_window(spark, start_ts, end_ts, args.location_ids, args.mode)
         if window is None:
             return
 
         window_start, window_end = window
+        logging.info("Building calendar date/time dimensions between %s and %s", window_start, window_end)
 
-        df = build_dataframe(spark, window_start, window_end)
-        rows = df.count()
-        logging.info(
-            "Preparing to upsert %d dim_calendar_hour rows between %s and %s",
-            rows,
-            window_start,
-            window_end,
-        )
+        hours_df = build_hours_dataframe(spark, window_start, window_end).cache()
+        try:
+            date_df = build_date_dimension(hours_df)
+            time_df = build_time_dimension(hours_df)
+        finally:
+            hours_df.unpersist()
 
-        if args.mode == "replace":
-            delete_range(spark, window_start, window_end)
-
-        merge_dimension(spark, df)
+        write_dates(spark, date_df)
+        write_times(spark, time_df)
     finally:
         spark.stop()
 

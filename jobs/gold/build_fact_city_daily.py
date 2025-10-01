@@ -54,6 +54,7 @@ def ensure_table(spark) -> None:
         f"""
         CREATE TABLE IF NOT EXISTS {FACT_DAILY_TABLE} (
           location_key STRING,
+          date_key STRING,
           date_utc DATE,
           pm25_daily_avg DOUBLE,
           pm25_daily_max DOUBLE,
@@ -100,6 +101,11 @@ def ensure_table(spark) -> None:
         )
         """
     )
+
+    if spark.catalog.tableExists(FACT_DAILY_TABLE):
+        field_names = {field.name for field in spark.table(FACT_DAILY_TABLE).schema.fields}
+        if "date_key" not in field_names:
+            spark.sql(f"ALTER TABLE {FACT_DAILY_TABLE} ADD COLUMN date_key STRING")
 
 
 def current_max_daily_date(spark) -> Optional[datetime]:
@@ -188,10 +194,12 @@ def aggregate_daily(df: DataFrame) -> DataFrame:
     if df.rdd.isEmpty():  # type: ignore[attr-defined]
         return df.limit(0)
 
+    df = df.withColumn("date_key", F.date_format(F.col("date_utc"), "yyyyMMdd"))
+
     dominant_struct = F.max(F.struct(F.col("aqi"), F.col("dominant_pollutant"))).alias("dominant_struct")
 
     aggregated = (
-        df.groupBy("location_key", "date_utc")
+        df.groupBy("location_key", "date_key", "date_utc")
         .agg(
             F.avg("pm25").alias("pm25_daily_avg"),
             F.max("pm25").alias("pm25_daily_max"),
@@ -215,7 +223,7 @@ def aggregate_daily(df: DataFrame) -> DataFrame:
             F.avg("aqi").alias("aqi_daily_avg"),
             F.max("aqi").cast("int").alias("aqi_daily_max"),
             dominant_struct,
-            F.count("calendar_hour_key").alias("hours_measured"),
+            F.count("ts_utc").alias("hours_measured"),
             F.lit(24).alias("total_hours"),
             F.avg("pm25_24h_avg").alias("pm25_24h_avg"),
             F.avg("pm10_24h_avg").alias("pm10_24h_avg"),
@@ -234,7 +242,43 @@ def aggregate_daily(df: DataFrame) -> DataFrame:
         .withColumn("updated_at", F.current_timestamp())
     )
 
-    return result
+    return result.select(
+        "location_key",
+        "date_key",
+        "date_utc",
+        "pm25_daily_avg",
+        "pm25_daily_max",
+        "pm25_daily_min",
+        "pm10_daily_avg",
+        "pm10_daily_max",
+        "pm10_daily_min",
+        "o3_daily_avg",
+        "o3_daily_max",
+        "no2_daily_avg",
+        "no2_daily_max",
+        "so2_daily_avg",
+        "so2_daily_max",
+        "co_daily_avg",
+        "co_daily_max",
+        "aod_daily_avg",
+        "uv_index_daily_avg",
+        "uv_index_daily_max",
+        "uv_index_clear_sky_daily_avg",
+        "uv_index_clear_sky_daily_max",
+        "aqi_daily_avg",
+        "aqi_daily_max",
+        "dominant_pollutant_daily",
+        "hours_measured",
+        "total_hours",
+        "data_completeness",
+        "pm25_24h_avg",
+        "pm10_24h_avg",
+        "co_8h_avg",
+        "notes",
+        "computed_at",
+        "created_at",
+        "updated_at",
+    )
 
 
 def delete_range(spark, start_ts: datetime, end_ts: datetime, location_ids: Iterable[str]) -> None:
