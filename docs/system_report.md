@@ -136,3 +136,18 @@ spark.sql.catalog.hadoop_catalog.warehouse hdfs://khoa-master:9000/warehouse/ice
 
 - Iceberg write guidance: the `aq.silver.aq_components_hourly` table now targets smaller Parquet files (32MB) and the components job will repartition computed dataframes before the Iceberg MERGE to avoid single-task driver writes. If you observe `java.lang.OutOfMemoryError` during local writes, increase `SPARK_DRIVER_MEMORY` and `SPARK_SQL_SHUFFLE_PARTITIONS` in the repository `.env` (for example `SPARK_DRIVER_MEMORY=12g` and `SPARK_SQL_SHUFFLE_PARTITIONS=200`), or run the job on Yarn/standalone so work is distributed across executors.
 - Confirm Spark workers on slave nodes and ensure warehouse path permissions align with jobs executed via PySpark.
+
+## Lakehouse Snapshot Pipeline Notes
+- Execute the notebook `notebooks/aqi_research.ipynb` to capture reproducible Iceberg snapshot_ids.
+- Section 3 of the notebook ("Snapshot Freezing") calls `CALL hadoop_catalog.system.create_snapshot_id(...)` for Gold and Silver tables and appends the run metadata to this document automatically.
+- Re-run the snapshot cell whenever the analytical dataset needs to be refreshed; commit the updated `docs/system_report.md` alongside outputs.
+## Lakehouse Snapshots (analysis freeze)
+- Captured: 2025-10-04T11:58:48.286475+00:00
+- Method: Manual metadata snapshot (fallback)
+  - hadoop_catalog.aq.gold.fact_air_quality_hourly → snapshot_id=5113860104107170895 (43848 rows)
+  - hadoop_catalog.aq.gold.dim_location → snapshot_id=2313316942555255018 (3 rows)
+  - hadoop_catalog.aq.gold.dim_calendar_date → snapshot_id=707119989561850929 (609 rows)
+  - hadoop_catalog.aq.gold.dim_calendar_time → snapshot_id=3619548003222607476 (24 rows)
+  - hadoop_catalog.aq.silver.air_quality_hourly_clean → snapshot_id=6864957037459163719 (43848 rows)
+  - hadoop_catalog.aq.silver.aq_components_hourly → snapshot_id=1285286009587970179 (43848 rows)
+  - hadoop_catalog.aq.silver.aq_index_hourly → snapshot_id=6017977126908461373 (43848 rows)
