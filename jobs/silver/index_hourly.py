@@ -155,9 +155,10 @@ def linear_aqi(column: F.Column, breakpoints: List[Tuple[float, float, int, int]
         expr = F.when((column >= F.lit(c_low)) & (column <= F.lit(c_high)), piece).otherwise(expr)
 
     # handle values above the highest breakpoint
+    # NOTE: we intentionally DO NOT extrapolate beyond the highest AQI breakpoint to avoid
+    # producing implausible AQI values. Instead clamp to the top AQI (typically 500).
     max_c_low, max_c_high, max_a_low, max_a_high = breakpoints[-1]
-    slope_high = (max_a_high - max_a_low) / (max_c_high - max_c_low)
-    expr = F.when(column > F.lit(max_c_high), (column - F.lit(max_c_high)) * F.lit(slope_high) + F.lit(max_a_high)).otherwise(expr)
+    expr = F.when(column > F.lit(max_c_high), F.lit(max_a_high)).otherwise(expr)
 
     expr = F.when(column.isNull(), None).otherwise(expr)
     return F.round(expr).cast("int")
@@ -169,10 +170,19 @@ def compute_indices(df: DataFrame, calc_method: str, run_id: str) -> DataFrame:
     pm25_aqi = linear_aqi(F.col("pm25_24h_avg"), bps["pm25"])
     pm10_aqi = linear_aqi(F.col("pm10_24h_avg"), bps["pm10"])
 
+    # Unit conversions: input component units are expected as follows:
+    # - o3_8h_max: µg/m³  -> convert to ppm (µg/m³ * (MOLAR_VOLUME / (MW * 1000)))
+    # - co_8h_max:  µg/m³  -> convert to ppm (µg/m³ * (MOLAR_VOLUME / (MW * 1000)))
+    # - no2_1h_max: µg/m³  -> convert to ppb (µg/m³ * (MOLAR_VOLUME / (MW * 1000)) * 1000)
+    # - so2_1h_max: µg/m³  -> convert to ppb (µg/m³ * (MOLAR_VOLUME / (MW * 1000)) * 1000)
+    # The factor 1000 adjustments map between µg/m³ and mg/m³ or ppm/ppb as needed.
+
     o3_ppm = F.col("o3_8h_max") * (MOLAR_VOLUME / (O3_MW * 1000.0))
-    co_ppm = F.col("co_8h_max") * (MOLAR_VOLUME / CO_MW)
-    no2_ppb = F.col("no2_1h_max") * (MOLAR_VOLUME / NO2_MW)
-    so2_ppb = F.col("so2_1h_max") * (MOLAR_VOLUME / SO2_MW)
+    # CO molecular weight conversion: convert µg/m³ -> ppm (use same *1/1000 factor)
+    co_ppm = F.col("co_8h_max") * (MOLAR_VOLUME / (CO_MW * 1000.0))
+    # NO2 and SO2 breakpoints are in ppb: convert µg/m³ -> ppb by scaling to ppm then *1000
+    no2_ppb = F.col("no2_1h_max") * (MOLAR_VOLUME / (NO2_MW * 1000.0)) * F.lit(1000.0)
+    so2_ppb = F.col("so2_1h_max") * (MOLAR_VOLUME / (SO2_MW * 1000.0)) * F.lit(1000.0)
 
     o3_aqi = linear_aqi(o3_ppm, bps["o3"])
     co_aqi = linear_aqi(co_ppm, bps["co"])
@@ -189,7 +199,9 @@ def compute_indices(df: DataFrame, calc_method: str, run_id: str) -> DataFrame:
         .withColumn("aqi_co", co_aqi)
     )
 
+    # Compute overall AQI as the max of sub-indices, then defensively cap to 500
     aqi_overall = F.greatest("aqi_pm25", "aqi_pm10", "aqi_o3", "aqi_no2", "aqi_so2", "aqi_co")
+    aqi_overall = F.when(aqi_overall.isNull(), None).otherwise(F.least(aqi_overall, F.lit(500)))
 
     categories = (
         F.when(aqi_overall.isNull(), None)

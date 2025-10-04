@@ -1,6 +1,6 @@
 layer,table,check,success,unexpected_percent,details
 gold,hadoop_catalog.aq.gold.fact_air_quality_hourly,AQI not null,True,0.0,"{'column': 'aqi', 'result_format': 'BASIC'}"
-gold,hadoop_catalog.aq.gold.fact_air_quality_hourly,AQI within 0-500,False,99.96573699719043,"{'column': 'aqi', 'min_value': 0, 'max_value': 500, 'result_format': 'BASIC'}"
+gold,hadoop_catalog.aq.gold.fact_air_quality_hourly,AQI within 0-500,False,99.96579091406677,"{'column': 'aqi', 'min_value': 0, 'max_value': 500, 'result_format': 'BASIC'}"
 gold,hadoop_catalog.aq.gold.fact_air_quality_hourly,PM2.5 non-negative,True,0.0,{}
 gold,hadoop_catalog.aq.gold.fact_air_quality_hourly,"Unique (location_key, ts_utc)",True,0.0,"{'column_list': ['location_key', 'ts_utc'], 'result_format': 'BASIC'}"
 gold,hadoop_catalog.aq.gold.fact_air_quality_hourly,AQI completeness ≥95%,True,0.0,{}
