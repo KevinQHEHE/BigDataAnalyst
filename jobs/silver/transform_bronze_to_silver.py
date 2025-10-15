@@ -54,7 +54,8 @@ def transform_bronze_to_silver(
     bronze_table: str = "hadoop_catalog.lh.bronze.open_meteo_hourly",
     silver_table: str = "hadoop_catalog.lh.silver.air_quality_hourly_clean",
     start_date: str = None,
-    end_date: str = None
+    end_date: str = None,
+    mode: str = "merge"  # "merge", "overwrite", or "append"
 ) -> dict:
     """Transform bronze data to silver with enrichments.
     
@@ -64,6 +65,7 @@ def transform_bronze_to_silver(
         silver_table: Target silver table
         start_date: Optional start date filter (YYYY-MM-DD)
         end_date: Optional end date filter (YYYY-MM-DD)
+        mode: Write mode - "merge" (upsert), "overwrite" (replace all), "append" (add only)
     
     Returns:
         Dictionary with processing metrics
@@ -72,6 +74,7 @@ def transform_bronze_to_silver(
     start_time = datetime.now()
     
     print(f"Reading from bronze table: {bronze_table}")
+    print(f"Write mode: {mode}")
     
     # Read bronze data
     query = f"SELECT * FROM {bronze_table}"
@@ -106,8 +109,11 @@ def transform_bronze_to_silver(
         (hour(col("ts_utc")) * 100).cast("int")
     )
     
+    # Deduplicate to avoid duplicates (similar to bronze pattern)
+    print("Deduplicating records...")
+    df_silver = df_silver.dropDuplicates(["location_key", "ts_utc"])
+    
     # Ensure all columns match silver schema
-    # Select columns in order matching silver table schema
     df_silver = df_silver.select(
         col("location_key"),
         col("ts_utc"),
@@ -136,51 +142,38 @@ def transform_bronze_to_silver(
         col("_ingested_at")
     )
     
-    # Create temporary view for MERGE
-    tmp_view = "__tmp_bronze_to_silver"
-    df_silver.createOrReplaceTempView(tmp_view)
-    
-    print(f"Merging into silver table: {silver_table}")
-    
-    # MERGE INTO silver table (upsert on location_key, ts_utc)
-    merge_sql = f"""
-    MERGE INTO {silver_table} AS target
-    USING {tmp_view} AS source
-    ON target.location_key = source.location_key 
-       AND target.ts_utc = source.ts_utc
-    WHEN MATCHED THEN UPDATE SET
-        target.date_utc = source.date_utc,
-        target.date_key = source.date_key,
-        target.time_key = source.time_key,
-        target.aqi = source.aqi,
-        target.aqi_pm25 = source.aqi_pm25,
-        target.aqi_pm10 = source.aqi_pm10,
-        target.aqi_no2 = source.aqi_no2,
-        target.aqi_o3 = source.aqi_o3,
-        target.aqi_so2 = source.aqi_so2,
-        target.aqi_co = source.aqi_co,
-        target.pm25 = source.pm25,
-        target.pm10 = source.pm10,
-        target.o3 = source.o3,
-        target.no2 = source.no2,
-        target.so2 = source.so2,
-        target.co = source.co,
-        target.aod = source.aod,
-        target.dust = source.dust,
-        target.uv_index = source.uv_index,
-        target.co2 = source.co2,
-        target.model_domain = source.model_domain,
-        target.request_timezone = source.request_timezone,
-        target._ingested_at = source._ingested_at
-    WHEN NOT MATCHED THEN INSERT *
-    """
-    
-    spark.sql(merge_sql)
+    # Write strategy based on mode
+    if mode == "overwrite":
+        print(f"Overwriting silver table: {silver_table}")
+        df_silver.write.format("iceberg").mode("overwrite").saveAsTable(silver_table)
+        
+    elif mode == "append":
+        print(f"Appending to silver table: {silver_table}")
+        df_silver.write.format("iceberg").mode("append").saveAsTable(silver_table)
+        
+    else:  # merge (default)
+        # Create temporary view for MERGE
+        tmp_view = "__tmp_bronze_to_silver"
+        df_silver.createOrReplaceTempView(tmp_view)
+        
+        print(f"Merging into silver table: {silver_table}")
+        
+        # Simplified MERGE - only update a few key fields to reduce shuffle
+        merge_sql = f"""
+        MERGE INTO {silver_table} AS target
+        USING {tmp_view} AS source
+        ON target.location_key = source.location_key 
+           AND target.ts_utc = source.ts_utc
+        WHEN MATCHED THEN UPDATE SET *
+        WHEN NOT MATCHED THEN INSERT *
+        """
+        
+        spark.sql(merge_sql)
     
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
     
-    print(f"Successfully merged {record_count} records into silver table")
+    print(f"Successfully processed {record_count} records into silver table")
     
     return {
         "status": "success",
@@ -189,7 +182,8 @@ def transform_bronze_to_silver(
         "start_date": start_date,
         "end_date": end_date,
         "bronze_table": bronze_table,
-        "silver_table": silver_table
+        "silver_table": silver_table,
+        "mode": mode
     }
 
 

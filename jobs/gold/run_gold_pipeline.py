@@ -1,37 +1,36 @@
-"""Gold Layer Pipeline - Load all dimension tables.
+"""Optimized Gold Pipeline - Simple, efficient, Prefect-ready.
 
-This script orchestrates loading all dimension tables in the gold layer:
-1. dim_location (from data/locations.jsonl)
-2. dim_pollutant (from data/dim_pollutant.jsonl)
-3. dim_time (auto-generated for 24 hours)
-4. dim_date (extracted from silver layer)
+Loads all dimension tables and transforms fact tables:
+- Dimensions: dim_location, dim_pollutant, dim_time, dim_date
+- Facts: fact_air_quality_hourly, fact_city_daily, fact_episode
 
 Usage:
-  bash scripts/spark_submit.sh jobs/gold/run_gold_pipeline.py -- [OPTIONS]
+  python3 jobs/gold/run_gold_pipeline.py --mode [dims|facts|all]
   
-  # Load all dimensions
-  bash scripts/spark_submit.sh jobs/gold/run_gold_pipeline.py
+  # Load all dimensions and facts
+  bash scripts/spark_submit.sh jobs/gold/run_gold_pipeline.py -- --mode all
   
-  # Load specific dimensions only
-  bash scripts/spark_submit.sh jobs/gold/run_gold_pipeline.py -- --only location,pollutant
+  # Load only dimensions
+  bash scripts/spark_submit.sh jobs/gold/run_gold_pipeline.py -- --mode dims
   
-  # Skip specific dimensions
-  bash scripts/spark_submit.sh jobs/gold/run_gold_pipeline.py -- --skip date
+  # Load only facts
+  bash scripts/spark_submit.sh jobs/gold/run_gold_pipeline.py -- --mode facts
   
-  # Custom data file paths
+  # Custom: specific dimensions and facts
   bash scripts/spark_submit.sh jobs/gold/run_gold_pipeline.py -- \
-    --locations /path/to/locations.jsonl \
-    --pollutants /path/to/dim_pollutant.jsonl
+    --mode custom \
+    --dims location,pollutant \
+    --facts hourly,daily
 """
 import argparse
 import os
 import sys
+import time
+from typing import Dict, Optional
 
-# Ensure local src is importable
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
-if SRC_DIR not in sys.path:
-    sys.path.insert(0, SRC_DIR)
+sys.path.insert(0, SRC_DIR)
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(ROOT_DIR, ".env"))
@@ -40,157 +39,170 @@ from pyspark.sql import SparkSession
 
 
 def build_spark_session(app_name: str = "run_gold_pipeline") -> SparkSession:
-    """Build Spark session for gold pipeline."""
     from lakehouse_aqi import spark_session
-    if os.getenv("SPARK_MASTER") or os.getenv("SPARK_HOME"):
-        return spark_session.build(app_name=app_name)
-    else:
-        return spark_session.build(app_name=app_name, mode="local")
+    mode = "cluster" if os.getenv("SPARK_MASTER") or os.getenv("SPARK_HOME") else "local"
+    return spark_session.build(app_name=app_name, mode=mode)
 
 
-def load_dimension_location(spark: SparkSession, locations_path: str) -> int:
-    """Load dim_location."""
-    from load_dim_location import load_dim_location
-    
-    print("\n" + "="*60)
-    print("Loading dim_location")
-    print("="*60)
-    
-    count = load_dim_location(spark=spark, locations_path=locations_path)
-    print(f"✓ dim_location loaded: {count} locations")
-    return count
+def execute_gold_pipeline(
+    mode: str = "all",
+    dims_to_load: str = "",
+    facts_to_load: str = "",
+    locations_path: str = "hdfs://khoa-master:9000/user/dlhnhom2/data/locations.jsonl",
+    pollutants_path: str = "hdfs://khoa-master:9000/user/dlhnhom2/data/dim_pollutant.jsonl",
+    warehouse: str = "hdfs://khoa-master:9000/warehouse/iceberg",
+    aqi_threshold: int = 151,
+    min_hours: int = 4
+) -> Dict:
+    """Prefect-friendly gold pipeline: dimensions + facts."""
+    try:
+        spark = build_spark_session()
+        spark.conf.set("spark.sql.catalog.hadoop_catalog.warehouse", warehouse)
+        
+        start_time = time.time()
+        
+        # Determine what to load
+        load_dims = set()
+        load_facts = set()
+        
+        if mode == "all":
+            load_dims = {"location", "pollutant", "time", "date"}
+            load_facts = {"hourly", "daily", "episode"}
+        elif mode == "dims":
+            load_dims = {"location", "pollutant", "time", "date"}
+        elif mode == "facts":
+            load_facts = {"hourly", "daily", "episode"}
+        elif mode == "custom":
+            if dims_to_load:
+                load_dims = set(d.strip().lower() for d in dims_to_load.split(","))
+            if facts_to_load:
+                load_facts = set(f.strip().lower() for f in facts_to_load.split(","))
+        
+        print(f"GOLD PIPELINE")
+        if load_dims:
+            print(f"  Dimensions: {', '.join(sorted(load_dims))}")
+        if load_facts:
+            print(f"  Facts: {', '.join(sorted(load_facts))}")
+        
+        results = {}
+        
+        # === LOAD DIMENSIONS ===
+        if load_dims:
+            print(f"\n{'='*60}")
+            print("LOADING DIMENSIONS")
+            print(f"{'='*60}")
+        
+        if "location" in load_dims:
+            from load_dim_location import load_dim_location
+            print("\n--- Loading dim_location ---")
+            count = load_dim_location(spark=spark, locations_path=locations_path)
+            results["dim_location"] = count
+        
+        if "pollutant" in load_dims:
+            from load_dim_pollutant import load_dim_pollutant
+            print("\n--- Loading dim_pollutant ---")
+            count = load_dim_pollutant(spark=spark, pollutants_path=pollutants_path)
+            results["dim_pollutant"] = count
+        
+        if "time" in load_dims:
+            from load_dim_time import generate_dim_time
+            print("\n--- Generating dim_time ---")
+            count = generate_dim_time(spark=spark)
+            results["dim_time"] = count
+        
+        if "date" in load_dims:
+            from load_dim_date import generate_dim_date
+            print("\n--- Generating dim_date ---")
+            count = generate_dim_date(spark=spark)
+            results["dim_date"] = count
+        
+        # === TRANSFORM FACTS ===
+        if load_facts:
+            print(f"\n{'='*60}")
+            print("TRANSFORMING FACTS")
+            print(f"{'='*60}")
+        
+        if "hourly" in load_facts:
+            from transform_fact_hourly import transform_fact_hourly
+            print("\n--- Transforming fact_air_quality_hourly ---")
+            result = transform_fact_hourly(spark=spark, mode="overwrite")
+            results["fact_hourly"] = result.get("records_processed", 0)
+        
+        if "daily" in load_facts:
+            from transform_fact_daily import transform_fact_daily
+            print("\n--- Transforming fact_city_daily ---")
+            result = transform_fact_daily(spark=spark, mode="overwrite")
+            results["fact_daily"] = result.get("records_processed", 0)
+        
+        if "episode" in load_facts:
+            from detect_episodes import detect_episodes
+            print("\n--- Detecting episodes ---")
+            result = detect_episodes(
+                spark=spark,
+                aqi_threshold=aqi_threshold,
+                min_hours=min_hours,
+                mode="overwrite"
+            )
+            results["fact_episode"] = result.get("episodes_detected", 0)
+        
+        elapsed = time.time() - start_time
+        
+        print(f"\n{'='*60}")
+        print("GOLD PIPELINE COMPLETED")
+        print(f"{'='*60}")
+        for key, value in results.items():
+            print(f"  {key}: {value} records")
+        print(f"  Total time: {elapsed:.1f}s")
+        print(f"{'='*60}")
+        
+        spark.stop()
+        
+        return {
+            "success": True,
+            "stats": results,
+            "elapsed_seconds": elapsed
+        }
+    except Exception as e:
+        print(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
 
 
-def load_dimension_pollutant(spark: SparkSession, pollutants_path: str) -> int:
-    """Load dim_pollutant."""
-    from load_dim_pollutant import load_dim_pollutant
-    
-    print("\n" + "="*60)
-    print("Loading dim_pollutant")
-    print("="*60)
-    
-    count = load_dim_pollutant(spark=spark, pollutants_path=pollutants_path)
-    print(f"✓ dim_pollutant loaded: {count} pollutants")
-    return count
-
-
-def load_dimension_time(spark: SparkSession) -> int:
-    """Generate and load dim_time."""
-    from load_dim_time import generate_dim_time
-    
-    print("\n" + "="*60)
-    print("Generating dim_time")
-    print("="*60)
-    
-    count = generate_dim_time(spark=spark)
-    print(f"✓ dim_time generated: {count} time records")
-    return count
-
-
-def load_dimension_date(spark: SparkSession) -> int:
-    """Generate and load dim_date from silver."""
-    from load_dim_date import generate_dim_date
-    
-    print("\n" + "="*60)
-    print("Generating dim_date (from silver layer)")
-    print("="*60)
-    
-    count = generate_dim_date(spark=spark)
-    print(f"✓ dim_date generated: {count} dates")
-    return count
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run gold layer pipeline: load all dimension tables"
-    )
-    parser.add_argument(
-        "--only",
-        default="",
-        help="Comma-separated list of dimensions to load (location,pollutant,time,date). If not set, all will be loaded."
-    )
-    parser.add_argument(
-        "--skip",
-        default="",
-        help="Comma-separated list of dimensions to skip (location,pollutant,time,date)"
-    )
-    parser.add_argument(
-        "--locations",
-        default="hdfs://khoa-master:9000/user/dlhnhom2/data/locations.jsonl",
-        help="Path to locations.jsonl (HDFS or local with file://)"
-    )
-    parser.add_argument(
-        "--pollutants",
-        default="hdfs://khoa-master:9000/user/dlhnhom2/data/dim_pollutant.jsonl",
-        help="Path to dim_pollutant.jsonl (HDFS or local with file://)"
-    )
+    parser = argparse.ArgumentParser(description="Gold Pipeline: Load dimensions + transform facts")
+    parser.add_argument("--mode", default="all", 
+                        help="Pipeline mode: all|dims|facts|custom (default: all)")
+    parser.add_argument("--dims", default="", 
+                        help="Comma-separated dimensions (for custom mode): location,pollutant,time,date")
+    parser.add_argument("--facts", default="", 
+                        help="Comma-separated facts (for custom mode): hourly,daily,episode")
+    parser.add_argument("--locations", default="hdfs://khoa-master:9000/user/dlhnhom2/data/locations.jsonl")
+    parser.add_argument("--pollutants", default="hdfs://khoa-master:9000/user/dlhnhom2/data/dim_pollutant.jsonl")
+    parser.add_argument("--warehouse", default="hdfs://khoa-master:9000/warehouse/iceberg")
+    parser.add_argument("--aqi-threshold", type=int, default=151, 
+                        help="AQI threshold for episode detection (default: 151)")
+    parser.add_argument("--min-hours", type=int, default=4, 
+                        help="Minimum consecutive hours for episode (default: 4)")
     
     args = parser.parse_args()
     
-    # Parse only/skip lists
-    only_dims = set(dim.strip().lower() for dim in args.only.split(",") if dim.strip())
-    skip_dims = set(dim.strip().lower() for dim in args.skip.split(",") if dim.strip())
+    result = execute_gold_pipeline(
+        mode=args.mode,
+        dims_to_load=args.dims,
+        facts_to_load=args.facts,
+        locations_path=args.locations,
+        pollutants_path=args.pollutants,
+        warehouse=args.warehouse,
+        aqi_threshold=args.aqi_threshold,
+        min_hours=args.min_hours
+    )
     
-    # Determine which dimensions to load
-    all_dims = {"location", "pollutant", "time", "date"}
-    if only_dims:
-        dims_to_load = only_dims & all_dims
-    else:
-        dims_to_load = all_dims - skip_dims
-    
-    if not dims_to_load:
-        print("No dimensions to load. Exiting.")
-        sys.exit(0)
-    
-    print(f"Dimensions to load: {', '.join(sorted(dims_to_load))}")
-    
-    # Build Spark session once for entire pipeline
-    spark = build_spark_session()
-    
-    try:
-        results = {}
-        
-        # Load dim_location
-        if "location" in dims_to_load:
-            results["dim_location"] = load_dimension_location(
-                spark=spark,
-                locations_path=args.locations
-            )
-        
-        # Load dim_pollutant
-        if "pollutant" in dims_to_load:
-            results["dim_pollutant"] = load_dimension_pollutant(
-                spark=spark,
-                pollutants_path=args.pollutants
-            )
-        
-        # Load dim_time
-        if "time" in dims_to_load:
-            results["dim_time"] = load_dimension_time(spark=spark)
-        
-        # Load dim_date (must run last as it depends on silver layer)
-        if "date" in dims_to_load:
-            results["dim_date"] = load_dimension_date(spark=spark)
-        
-        # Print final summary
-        print("\n" + "="*60)
-        print("GOLD PIPELINE COMPLETED SUCCESSFULLY")
-        print("="*60)
-        for key, value in results.items():
-            print(f"  {key}: {value} records")
-        print("="*60)
-        
-    except Exception as e:
-        print(f"\n{'='*60}")
-        print(f"ERROR: Gold pipeline failed")
-        print(f"{'='*60}")
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    finally:
-        spark.stop()
+    sys.exit(0 if result["success"] else 1)
 
 
 if __name__ == "__main__":
     main()
+
