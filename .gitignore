@@ -193,7 +193,6 @@ gcloud_credentials
 
 # Project specific
 # Ignore data, artifacts and run outputs
-/data/
 /outputs/
 /results/
 /work/

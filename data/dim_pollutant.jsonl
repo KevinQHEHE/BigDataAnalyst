@@ -1,0 +1,10 @@
+{"pollutant_code":"pm25","display_name":"PM2.5","unit_default":"µg/m³","aqi_timespan":"24h"}
+{"pollutant_code":"pm10","display_name":"PM10","unit_default":"µg/m³","aqi_timespan":"24h"}
+{"pollutant_code":"o3","display_name":"Ozone (O₃)","unit_default":"µg/m³","aqi_timespan":"8h"}
+{"pollutant_code":"no2","display_name":"Nitrogen Dioxide (NO₂)","unit_default":"µg/m³","aqi_timespan":"1h"}
+{"pollutant_code":"so2","display_name":"Sulphur Dioxide (SO₂)","unit_default":"µg/m³","aqi_timespan":"1h"}
+{"pollutant_code":"co","display_name":"Carbon Monoxide (CO)","unit_default":"µg/m³","aqi_timespan":"8h"}
+{"pollutant_code":"aod","display_name":"Aerosol Optical Depth","unit_default":"index","aqi_timespan":null}
+{"pollutant_code":"dust","display_name":"Dust","unit_default":"µg/m³","aqi_timespan":null}
+{"pollutant_code":"uv_index","display_name":"UV Index","unit_default":"index","aqi_timespan":null}
+{"pollutant_code":"co2","display_name":"Carbon Dioxide (CO₂)","unit_default":"ppm","aqi_timespan":null}
