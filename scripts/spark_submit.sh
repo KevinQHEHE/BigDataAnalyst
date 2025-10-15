@@ -35,13 +35,9 @@ SPARK_CONF=(
   "--conf" "spark.sql.adaptive.enabled=true"
   "--conf" "spark.dynamicAllocation.minExecutors=1"
   "--conf" "spark.dynamicAllocation.maxExecutors=50"
-  # Disk usage optimization - force cleanup of staging files
   "--conf" "spark.yarn.preserve.staging.files=false"
-  # Use archiving to reduce staging size (upload once, reuse)
   "--conf" "spark.yarn.archive=hdfs://khoa-master:9000/user/dlhnhom2/spark-libs.zip"
-  # Limit event log retention (if event logging is enabled)
   "--conf" "spark.eventLog.compress=true"
-  # Clean up temporary local files
   "--conf" "spark.cleaner.referenceTracking.cleanCheckpoints=true"
 )
 
