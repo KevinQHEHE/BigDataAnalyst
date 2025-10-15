@@ -1,18 +1,17 @@
 """Create Iceberg namespaces and tables for LH (bronze/silver/gold).
 
 Usage:
-  python scripts/create_lh_tables.py [--dry-run] [--warehouse WAREHOUSE_URI]
+  python scripts/create_lh_tables.py [--dry-run] [--warehouse WAREHOUSE_URI] [--drop-all]
 
 This script connects to a Spark session (local for dev if not submitted) and runs
 CREATE NAMESPACE / CREATE TABLE statements for the required dims and facts.
 
 If --dry-run is provided, SQL statements will be printed instead of executed.
+If --drop-all is provided, all existing tables will be dropped before creating new ones.
 """
 import argparse
-import json
 import os
 import sys
-from typing import List
 
 # Ensure local src is importable when running scripts directly
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -36,31 +35,57 @@ def build_spark_session(app_name: str = "create_lh_tables") -> SparkSession:
     else:
         return spark_session.build(app_name=app_name, mode="local")
 
-
-def load_locations(cfg_path: str) -> List[dict]:
-    if not os.path.exists(cfg_path):
-        return []
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 def run_or_print(spark: SparkSession, sql: str, dry_run: bool):
     print("-- SQL: ", sql)
     if not dry_run:
-        spark.sql(sql)
+        try:
+            spark.sql(sql)
+            print("   ✓ Success")
+        except Exception as e:
+            print(f"   ✗ Error: {e}")
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--warehouse", default=os.getenv("WAREHOUSE_URI", "hdfs://khoa-master:9000/warehouse/iceberg"))
-    p.add_argument("--locations", default="configs/locations.json")
+    p.add_argument("--drop-all", action="store_true", help="Drop all existing tables before creating new ones")
     args = p.parse_args()
 
-    spark = build_spark_session()
-    spark.conf.set("spark.sql.catalog.hadoop_catalog.warehouse", args.warehouse)
-
+    # Respect dry-run: only build a Spark session when actually executing
     dry = args.dry_run
+    spark = None
+    if not dry:
+        spark = build_spark_session()
+        spark.conf.set("spark.sql.catalog.hadoop_catalog.warehouse", args.warehouse)
+
+    # Drop all tables if requested
+    if args.drop_all:
+        print("=" * 60)
+        print("DROPPING ALL EXISTING TABLES")
+        print("=" * 60)
+        
+        # Drop tables in reverse dependency order
+        print("\n### Dropping GOLD Fact Tables ###")
+        run_or_print(spark, "DROP TABLE IF EXISTS hadoop_catalog.lh.gold.fact_episode", dry)
+        run_or_print(spark, "DROP TABLE IF EXISTS hadoop_catalog.lh.gold.fact_city_daily", dry)
+        run_or_print(spark, "DROP TABLE IF EXISTS hadoop_catalog.lh.gold.fact_air_quality_hourly", dry)
+
+        print("\n### Dropping GOLD Dimension Tables ###")
+        run_or_print(spark, "DROP TABLE IF EXISTS hadoop_catalog.lh.gold.dim_pollutant", dry)
+        run_or_print(spark, "DROP TABLE IF EXISTS hadoop_catalog.lh.gold.dim_location", dry)
+        run_or_print(spark, "DROP TABLE IF EXISTS hadoop_catalog.lh.gold.dim_time", dry)
+        run_or_print(spark, "DROP TABLE IF EXISTS hadoop_catalog.lh.gold.dim_date", dry)
+
+        print("\n### Dropping SILVER Tables ###")
+        run_or_print(spark, "DROP TABLE IF EXISTS hadoop_catalog.lh.silver.air_quality_hourly_clean", dry)
+
+        print("\n### Dropping BRONZE Tables ###")
+        run_or_print(spark, "DROP TABLE IF EXISTS hadoop_catalog.lh.bronze.open_meteo_hourly", dry)
+        
+        print("\n" + "=" * 60)
+        print("DROP COMPLETE - Now creating tables...")
+        print("=" * 60 + "\n")
 
     # Create namespaces (use hadoop_catalog prefix for multi-part namespaces)
     namespaces = ["hadoop_catalog.lh.bronze", "hadoop_catalog.lh.silver", "hadoop_catalog.lh.gold"]
@@ -68,34 +93,43 @@ def main():
         run_or_print(spark, f"CREATE NAMESPACE IF NOT EXISTS {ns}", dry)
 
     # Dimensions
-    # dim_date: date_key, date_utc, year, month, day, dow
+    # dim_date: date_key (YYYYMMDD), date_value, day_of_month, day_of_week, week_of_year, month, month_name, quarter, year, is_weekend
     run_or_print(
         spark,
         """
         CREATE TABLE IF NOT EXISTS hadoop_catalog.lh.gold.dim_date (
-          date_key STRING,
-          date_utc DATE,
-          year INT,
+          date_key INT,
+          date_value DATE,
+          day_of_month INT,
+          day_of_week INT,
+          week_of_year INT,
           month INT,
-          day INT,
-          dow INT
-        ) USING iceberg PARTITIONED BY (days(date_utc))
+          month_name STRING,
+          quarter INT,
+          year INT,
+          is_weekend BOOLEAN
+        ) USING iceberg
+        TBLPROPERTIES ('format-version'='2')
         """,
         dry,
     )
 
-    # dim_time: hour 0-23
+    # dim_time: time_key (HH00), time_value, hour, work_shift
     run_or_print(
         spark,
         """
         CREATE TABLE IF NOT EXISTS hadoop_catalog.lh.gold.dim_time (
-          hour INT
+          time_key INT,
+          time_value STRING,
+          hour INT,
+          work_shift STRING
         ) USING iceberg
+        TBLPROPERTIES ('format-version'='2')
         """,
         dry,
     )
 
-    # dim_location: location_key, location_name, latitude, longitude
+    # dim_location: location_key, location_name, latitude, longitude, timezone
     run_or_print(
         spark,
         """
@@ -103,67 +137,99 @@ def main():
           location_key STRING,
           location_name STRING,
           latitude DOUBLE,
-          longitude DOUBLE
+          longitude DOUBLE,
+          timezone STRING
         ) USING iceberg
+        TBLPROPERTIES ('format-version'='2')
         """,
         dry,
     )
 
-    # dim_pollutant: code, name
+    # dim_pollutant: pollutant_code, display_name, unit_default, aqi_timespan
     run_or_print(
         spark,
         """
         CREATE TABLE IF NOT EXISTS hadoop_catalog.lh.gold.dim_pollutant (
-          code STRING,
-          name STRING
+          pollutant_code STRING,
+          display_name STRING,
+          unit_default STRING,
+          aqi_timespan STRING
         ) USING iceberg
+        TBLPROPERTIES ('format-version'='2')
         """,
         dry,
     )
 
-    # Bronze table (raw)
+    # Bronze table (raw landing from Open-Meteo)
     run_or_print(
         spark,
         """
         CREATE TABLE IF NOT EXISTS hadoop_catalog.lh.bronze.open_meteo_hourly (
-          location_id STRING,
+          location_key STRING NOT NULL,
+          ts_utc TIMESTAMP NOT NULL,
+          date_utc DATE NOT NULL,
           latitude DOUBLE,
           longitude DOUBLE,
-          ts TIMESTAMP,
-          aerosol_optical_depth DOUBLE,
-          pm2_5 DOUBLE,
+          aqi INT,
+          aqi_pm25 INT,
+          aqi_pm10 INT,
+          aqi_no2 INT,
+          aqi_o3 INT,
+          aqi_so2 INT,
+          aqi_co INT,
+          pm25 DOUBLE,
           pm10 DOUBLE,
+          o3 DOUBLE,
+          no2 DOUBLE,
+          so2 DOUBLE,
+          co DOUBLE,
+          aod DOUBLE,
           dust DOUBLE,
-          nitrogen_dioxide DOUBLE,
-          ozone DOUBLE,
-          sulphur_dioxide DOUBLE,
-          carbon_monoxide DOUBLE,
           uv_index DOUBLE,
-          uv_index_clear_sky DOUBLE,
-          source STRING,
-          run_id STRING,
-          ingested_at TIMESTAMP
-        ) USING iceberg PARTITIONED BY (days(ts))
+          co2 DOUBLE,
+          model_domain STRING,
+          request_timezone STRING,
+          _ingested_at TIMESTAMP
+        ) USING PARQUET
+        PARTITIONED BY (date_utc, location_key)
+        TBLPROPERTIES ('parquet.compression'='ZSTD')
         """,
         dry,
     )
 
-    # Silver table (cleaned)
+    # Silver table (standardized & enriched)
     run_or_print(
         spark,
         """
         CREATE TABLE IF NOT EXISTS hadoop_catalog.lh.silver.air_quality_hourly_clean (
-          location_key STRING,
-          ts TIMESTAMP,
-          pm2_5 DOUBLE,
+          location_key STRING NOT NULL,
+          ts_utc TIMESTAMP NOT NULL,
+          date_utc DATE NOT NULL,
+          date_key INT,
+          time_key INT,
+          aqi INT,
+          aqi_pm25 INT,
+          aqi_pm10 INT,
+          aqi_no2 INT,
+          aqi_o3 INT,
+          aqi_so2 INT,
+          aqi_co INT,
+          pm25 DOUBLE,
           pm10 DOUBLE,
-          ozone DOUBLE,
-          nitrogen_dioxide DOUBLE,
-          sulphur_dioxide DOUBLE,
-          carbon_monoxide DOUBLE,
-          run_id STRING,
-          ingested_at TIMESTAMP
-        ) USING iceberg PARTITIONED BY (days(ts))
+          o3 DOUBLE,
+          no2 DOUBLE,
+          so2 DOUBLE,
+          co DOUBLE,
+          aod DOUBLE,
+          dust DOUBLE,
+          uv_index DOUBLE,
+          co2 DOUBLE,
+          model_domain STRING,
+          request_timezone STRING,
+          _ingested_at TIMESTAMP
+        ) USING PARQUET
+        PARTITIONED BY (date_utc, location_key)
+        TBLPROPERTIES ('parquet.compression'='ZSTD')
         """,
         dry,
     )
@@ -173,13 +239,34 @@ def main():
         spark,
         """
         CREATE TABLE IF NOT EXISTS hadoop_catalog.lh.gold.fact_air_quality_hourly (
-          location_key STRING,
-          date_utc DATE,
-          hour INT,
-          pm2_5 DOUBLE,
+          record_id STRING,
+          location_key STRING NOT NULL,
+          ts_utc TIMESTAMP NOT NULL,
+          date_utc DATE NOT NULL,
+          date_key INT,
+          time_key INT,
+          aqi INT,
+          aqi_pm25 INT,
+          aqi_pm10 INT,
+          aqi_no2 INT,
+          aqi_o3 INT,
+          aqi_so2 INT,
+          aqi_co INT,
+          pm25 DOUBLE,
           pm10 DOUBLE,
-          ozone DOUBLE
-        ) USING iceberg PARTITIONED BY (days(date_utc), location_key)
+          o3 DOUBLE,
+          no2 DOUBLE,
+          so2 DOUBLE,
+          co DOUBLE,
+          aod DOUBLE,
+          dust DOUBLE,
+          uv_index DOUBLE,
+          co2 DOUBLE,
+          dominant_pollutant STRING,
+          data_completeness DOUBLE
+        ) USING PARQUET
+        PARTITIONED BY (date_utc, location_key)
+        TBLPROPERTIES ('parquet.compression'='ZSTD')
         """,
         dry,
     )
@@ -188,11 +275,23 @@ def main():
         spark,
         """
         CREATE TABLE IF NOT EXISTS hadoop_catalog.lh.gold.fact_city_daily (
-          location_key STRING,
-          date_utc DATE,
-          avg_pm2_5 DOUBLE,
-          max_pm10 DOUBLE
-        ) USING iceberg PARTITIONED BY (days(date_utc), location_key)
+          daily_record_id STRING,
+          location_key STRING NOT NULL,
+          date_utc DATE NOT NULL,
+          date_key INT,
+          aqi_daily_max INT,
+          dominant_pollutant_daily STRING,
+          hours_in_cat_good INT,
+          hours_in_cat_moderate INT,
+          hours_in_cat_usg INT,
+          hours_in_cat_unhealthy INT,
+          hours_in_cat_very_unhealthy INT,
+          hours_in_cat_hazardous INT,
+          hours_measured INT,
+          data_completeness DOUBLE
+        ) USING PARQUET
+        PARTITIONED BY (date_utc, location_key)
+        TBLPROPERTIES ('parquet.compression'='ZSTD')
         """,
         dry,
     )
@@ -202,47 +301,23 @@ def main():
         """
         CREATE TABLE IF NOT EXISTS hadoop_catalog.lh.gold.fact_episode (
           episode_id STRING,
-          location_key STRING,
-          start_date_utc DATE,
-          end_date_utc DATE,
-          severity STRING
-        ) USING iceberg PARTITIONED BY (days(start_date_utc), location_key)
+          location_key STRING NOT NULL,
+          start_ts_utc TIMESTAMP NOT NULL,
+          end_ts_utc TIMESTAMP NOT NULL,
+          start_date_utc DATE NOT NULL,
+          duration_hours INT,
+          peak_aqi INT,
+          hours_flagged INT,
+          dominant_pollutant STRING,
+          rule_code STRING
+        ) USING PARQUET
+        PARTITIONED BY (start_date_utc, location_key)
+        TBLPROPERTIES ('parquet.compression'='ZSTD')
         """,
         dry,
     )
 
-    # Seed dims
-    locations = load_locations(args.locations)
-    # Seed dim_time (0-23)
-    time_rows = ",".join([f"({h})" for h in range(24)])
-    run_or_print(spark, f"INSERT INTO hadoop_catalog.lh.gold.dim_time VALUES {time_rows}", dry)
-
-    # Seed dim_location (take at least two from configs)
-    if locations:
-        loc_vals = []
-        for loc in locations[:5]:
-            key = loc.get("location_key") or loc.get("id") or loc.get("name")
-            name = loc.get("location_name") or loc.get("name")
-            lat = loc.get("latitude")
-            lon = loc.get("longitude")
-            # sanitize single quotes in names
-            if name is None:
-                name = ""
-            name = str(name).replace("'", "\\'")
-            loc_vals.append(f"('{key}','{name}',{lat},{lon})")
-        if loc_vals:
-            run_or_print(spark, f"INSERT INTO hadoop_catalog.lh.gold.dim_location VALUES {','.join(loc_vals)}", dry)
-
-    # Seed dim_pollutant minimal set
-    pollutants = [
-        ("pm2_5", "Particulate matter <2.5µm"),
-        ("pm10", "Particulate matter <10µm"),
-        ("ozone", "Ozone"),
-    ]
-    poll_vals = ",".join([f"('{c}','{n}')" for c, n in pollutants])
-    run_or_print(spark, f"INSERT INTO hadoop_catalog.lh.gold.dim_pollutant VALUES {poll_vals}", dry)
-
-    print("Done (dry_run=" + str(dry) + ")")
+    print("DONE (dry_run=" + str(dry) + ")")
 
 
 if __name__ == "__main__":
