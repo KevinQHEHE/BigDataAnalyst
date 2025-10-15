@@ -55,7 +55,7 @@ def transform_bronze_to_silver(
     silver_table: str = "hadoop_catalog.lh.silver.air_quality_hourly_clean",
     start_date: str = None,
     end_date: str = None
-) -> int:
+) -> dict:
     """Transform bronze data to silver with enrichments.
     
     Args:
@@ -66,8 +66,11 @@ def transform_bronze_to_silver(
         end_date: Optional end date filter (YYYY-MM-DD)
     
     Returns:
-        Number of records processed
+        Dictionary with processing metrics
     """
+    from datetime import datetime
+    start_time = datetime.now()
+    
     print(f"Reading from bronze table: {bronze_table}")
     
     # Read bronze data
@@ -81,11 +84,18 @@ def transform_bronze_to_silver(
     
     df_bronze = spark.sql(query)
     
-    if df_bronze.count() == 0:
+    record_count = df_bronze.count()
+    if record_count == 0:
         print("No data to process in bronze table")
-        return 0
+        return {
+            "status": "skipped",
+            "records_processed": 0,
+            "duration_seconds": 0,
+            "start_date": start_date,
+            "end_date": end_date
+        }
     
-    print(f"Processing {df_bronze.count()} records from bronze")
+    print(f"Processing {record_count} records from bronze")
     
     # Transform: add date_key and time_key
     df_silver = df_bronze.withColumn(
@@ -167,10 +177,20 @@ def transform_bronze_to_silver(
     
     spark.sql(merge_sql)
     
-    record_count = df_silver.count()
+    end_time = datetime.now()
+    duration = (end_time - start_time).total_seconds()
+    
     print(f"Successfully merged {record_count} records into silver table")
     
-    return record_count
+    return {
+        "status": "success",
+        "records_processed": record_count,
+        "duration_seconds": duration,
+        "start_date": start_date,
+        "end_date": end_date,
+        "bronze_table": bronze_table,
+        "silver_table": silver_table
+    }
 
 
 def main():
@@ -210,7 +230,7 @@ def main():
     spark = build_spark_session()
     
     try:
-        record_count = transform_bronze_to_silver(
+        result = transform_bronze_to_silver(
             spark=spark,
             bronze_table=args.bronze_table,
             silver_table=args.silver_table,
@@ -219,9 +239,14 @@ def main():
         )
         
         print(f"\n{'='*60}")
-        print(f"Bronze → Silver transformation completed successfully")
-        print(f"Records processed: {record_count}")
+        print(f"Bronze → Silver transformation completed")
+        print(f"Status: {result['status']}")
+        print(f"Records processed: {result['records_processed']}")
+        print(f"Duration: {result['duration_seconds']:.2f}s")
         print(f"{'='*60}")
+        
+        # Return 0 for success, even if skipped
+        sys.exit(0)
         
     except Exception as e:
         print(f"Error during transformation: {e}")
