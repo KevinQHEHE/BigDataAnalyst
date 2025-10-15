@@ -20,6 +20,6 @@ except Exception as e:
 
 print("\nDropping table...")
 spark.sql("DROP TABLE IF EXISTS hadoop_catalog.lh.bronze.open_meteo_hourly")
-print("✓ Table dropped - will be recreated on next insert\n")
+print("Table dropped - will be recreated on next insert\n")
 
 spark.stop()

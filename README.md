@@ -1,6 +1,41 @@
-# Air Quality Lakehouse Readiness Guide
+# Air Quality Lakehouse - Production Data Pipeline
 
-This repository prepares a local lakehouse stack for analysing air-quality data (Open-Meteo hourly feeds, daily KPIs, episodes, forecasting). It documents what is already installed on the host, how to verify health quickly, the tables we expect to build, and the analytics backlog.
+**Lakehouse AQI** is a production-grade data pipeline for air quality analytics built on Apache Iceberg, PySpark 4.0, and HDFS. The pipeline ingests hourly air quality data from Open-Meteo API, transforms it through Bronze → Silver → Gold layers, and provides comprehensive data quality validation.
+
+## Features
+
+- **Multi-layer Architecture**: Bronze (raw), Silver (cleaned), Gold (star schema) data layers
+- **Apache Iceberg**: ACID transactions, schema evolution, time travel
+- **Comprehensive Validation**: Automated data quality checks for all layers
+- **Prefect-Ready**: Task wrappers for orchestration and scheduling
+- **Production-Tested**: Running on YARN cluster with 47K+ hourly records
+
+## Quick Start
+
+```bash
+# Run full pipeline with validation
+bash scripts/run_full_pipeline_with_validation.sh --mode full
+
+# Or run individual layers
+bash scripts/run_ingest_bronze.sh --mode full          # Bronze ingestion
+bash scripts/run_silver_pipeline.sh --mode full        # Silver transformation
+bash scripts/run_gold_pipeline.sh --mode all           # Gold transformation + dims
+
+# Validate data quality
+python3 scripts/validate/validate_all.py               # All layers
+python3 scripts/validate/validate_bronze.py            # Bronze only
+python3 scripts/validate/validate_silver.py            # Silver only
+python3 scripts/validate/validate_gold.py              # Gold only
+```
+
+## Documentation
+
+- **[Validation Framework](docs/validation/README.md)**: Comprehensive guide to data quality validation
+- **[Quick Reference](docs/validation/QUICKSTART.md)**: Common validation commands
+- **[Bronze Layer](docs/ingest/bronze.md)**: Raw data ingestion
+- **[Silver Layer](docs/ingest/silver.md)**: Data cleaning and transformation
+- **[Gold Layer](docs/ingest/gold.md)**: Star schema and business logic
+- **[Schema Definition](docs/schema/full-schema.sql)**: Complete table schemas
 
 ## System Snapshot
 
@@ -64,60 +99,185 @@ The script prints `[OK]`, `[WARN]`, `[ERROR]` per check and exits with status `0
 - Key packages pinned via `requirements.txt` (PySpark, PyArrow, MLflow, pandas, scikit-learn).
 - Virtual environment optional (`python3 -m venv venv && source venv/bin/activate`).
 
+## Data Architecture
+
+### Pipeline Layers
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        GOLD LAYER (Star Schema)                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
+│  │  Dimensions  │  │    Facts     │  │   Episodes   │          │
+│  │ - location   │  │ - hourly     │  │ - detection  │          │
+│  │ - pollutant  │  │ - daily      │  │ - analytics  │          │
+│  │ - time       │  │ - enriched   │  │              │          │
+│  │ - date       │  │              │  │              │          │
+│  └──────────────┘  └──────────────┘  └──────────────┘          │
+└─────────────────────────────────────────────────────────────────┘
+                            ▲
+                            │ transform_fact_*.py
+                            │ load_dim_*.py
+┌─────────────────────────────────────────────────────────────────┐
+│                    SILVER LAYER (Cleaned Data)                   │
+│                  air_quality_hourly_clean                        │
+│  - Standardized AQI calculation                                 │
+│  - Data quality checks (deduplication, null handling)           │
+│  - Transformed columns (date_key, time_key)                     │
+│  - Partitioned by (date_utc, location_key)                      │
+└─────────────────────────────────────────────────────────────────┘
+                            ▲
+                            │ transform_bronze_to_silver.py
+                            │
+┌─────────────────────────────────────────────────────────────────┐
+│                   BRONZE LAYER (Raw Ingestion)                   │
+│                  open_meteo_hourly                               │
+│  - Raw API data from Open-Meteo                                 │
+│  - Minimal transformations                                      │
+│  - Full history retention                                       │
+│  - Partitioned by (date_utc, location_key)                      │
+└─────────────────────────────────────────────────────────────────┘
+                            ▲
+                            │ ingest_bronze.py
+                            │
+                    ┌───────────────┐
+                    │  Open-Meteo   │
+                    │  Air Quality  │
+                    │      API      │
+                    └───────────────┘
+```
+
+### Data Quality Framework
+
+Each layer includes comprehensive validation:
+
+- **Bronze**: Schema compliance, duplicates, null values, AQI ranges, data freshness, partitioning
+- **Silver**: Transformations, data quality, consistency with Bronze (≥90% retention)
+- **Gold**: Dimensions completeness, fact table business rules, referential integrity
+
+Run validations after each pipeline execution:
+```bash
+python3 scripts/validate/validate_all.py
+```
+
+See [Validation Framework](docs/validation/README.md) for details.
+
 ## Data Warehouse Model
 
-Target schema lives in `docs/schema/Sample.sql`, covering:
+Target schema lives in `docs/schema/full-schema.sql`, covering:
 
-- `dim_date`, `dim_time`, `dim_location`, `dim_pollutant`
-- `fact_air_quality_hourly`
-- `fact_city_daily`
-- `fact_episode`
+- **Dimensions**: `dim_date`, `dim_time`, `dim_location`, `dim_pollutant`
+- **Facts**: `fact_air_quality_hourly`, `fact_air_quality_daily`, `fact_aqi_episode`
 
-All fact tables are designed for Iceberg tables served from the Hadoop catalog. Hourly fact data is the canonical source for downstream aggregations and ML feature builds.
+All tables are Apache Iceberg format with PARQUET storage and ZSTD compression. Hourly fact data is the canonical source for downstream aggregations and ML feature builds.
+
+### Current Data Volumes
+
+| Layer | Table | Records | Status |
+|-------|-------|---------|--------|
+| Bronze | open_meteo_hourly | 47,088 | ✅ Validated |
+| Silver | air_quality_hourly_clean | 47,088 | ✅ Validated |
+| Gold | dim_location | 3 | ✅ Validated |
+| Gold | dim_pollutant | 10 | ✅ Validated |
+| Gold | dim_time | 24 | ✅ Validated |
+| Gold | dim_date | 654 | ✅ Validated |
+| Gold | fact_air_quality_hourly | 47,088 | ✅ Validated |
+| Gold | fact_air_quality_daily | 1,962 | ✅ Validated |
+| Gold | fact_aqi_episode | 396 | ✅ Validated |
 
 ## Analytics Backlog
 
 ### 1. City AQI KPI & Benchmark
-- **Inputs**: Open-Meteo hourly feed -> `time, aqi, aqi_*` plus pollutant concentrations (`pm2_5`, `pm10`, `ozone`, `no2`, `so2`, `co`, `dust`, `uv_index`, `aerosol_optical_depth`).
-- **Transformations**:
-  - Normalize timestamps (UTC vs local time zones derived from `configs/locations.json`).
-  - Populate hourly warehouse table (`fact_air_quality_hourly`) with completeness flags.
-  - Aggregate into daily KPI table (`fact_city_daily`) computing `aqi_daily_max`, hourly counts per US AQI category, `dominant_pollutant_daily_us`, and `data_completeness`.
-- **Visuals**:
-  - Multi-city AQI line chart (hourly resolution, timezone-aware).
-  - Stacked bar (hours per AQI category by day).
-  - Calendar heatmap of `aqi_daily_max`.
+- **Inputs**: Open-Meteo hourly feed → `time, aqi, aqi_*` plus pollutant concentrations
+- **Status**: ✅ **COMPLETED**
+  - Hourly fact table with completeness flags
+  - Daily aggregates with AQI category counts
+  - Dominant pollutant tracking
+- **Visuals** (Pending):
+  - Multi-city AQI line chart (hourly resolution, timezone-aware)
+  - Stacked bar (hours per AQI category by day)
+  - Calendar heatmap of `aqi_daily_max`
 
 ### 2. Episode Detection (US AQI)
-- **Goal**: Detect contiguous pollution episodes per city when AQI >= threshold (default 151) lasting >= configurable hours (default 4).
-- **Process**:
-  - Use hourly fact table to derive boolean episode flag per timestamp.
-  - Collapse runs into `fact_episode_us` (episode id, start/end UTC, duration, peak AQI, hours flagged, dominant pollutant, rule code).
-  - Summaries: monthly episode counts, average duration, total hours above threshold.
-- **Visuals**:
-  - Timeline/Gantt per city highlighting episode blocks.
-  - Duration distribution (histogram or violin).
-  - Geo scatter map sized by `peak_aqi`.
+- **Goal**: Detect pollution episodes when AQI ≥ 151 lasting ≥ 4 hours
+- **Status**: ✅ **COMPLETED**
+  - Episode detection using window functions
+  - `fact_aqi_episode` table with 396 episodes detected
+  - Configurable thresholds (AQI, duration)
+- **Visuals** (Pending):
+  - Timeline/Gantt per city highlighting episode blocks
+  - Duration distribution (histogram or violin)
+  - Geo scatter map sized by `peak_aqi`
 
 ### 3. PM2.5 Forecasting
-- **Target**: Predict `pm2_5` at horizons t+1, t+3, t+24 hours.
-- **Feature Store**:
-  - Lagged and rolling aggregates for `pm2_5` and co-pollutants (`pm10`, `ozone`, `no2`, `so2`, `co`, `dust`, `aerosol_optical_depth`, `uv_index`).
-  - Time-based features (`hour`, `day_of_week`, `month`).
-  - Optional expansion with meteorology (wind, temperature) once ingested.
-  - Strict leakage prevention (no using contemporaneous `aqi_pm2_5` as a feature).
-- **Outputs**:
-  - Feature table keyed by (location_key, timestamp, horizon).
-  - Labels table with fold identifiers for reproducible CV.
-  - Optional feature-importance tracking per model revision.
-- **Visuals**:
-  - Actual vs forecast line plot (per horizon/city).
-  - `y_hat` vs `y` scatter and residual distribution.
-  - Feature-importance bar chart.
+- **Target**: Predict `pm2_5` at horizons t+1, t+3, t+24 hours
+- **Status**: 🔄 **IN PROGRESS**
+  - Feature store design (lagged, rolling aggregates)
+  - Time-based features (hour, day_of_week, month)
+  - Leakage prevention controls
+- **Next Steps**:
+  - Create feature table keyed by (location_key, timestamp, horizon)
+  - Labels table with fold identifiers for reproducible CV
+  - Model training and evaluation pipeline
+
+## Pipeline Operations
+
+### Full Pipeline Execution
+```bash
+# Run complete pipeline with validation
+bash scripts/run_full_pipeline_with_validation.sh --mode full
+
+# Incremental updates only
+bash scripts/run_full_pipeline_with_validation.sh --mode incremental
+```
+
+### Individual Layer Execution
+```bash
+# Bronze: Ingest raw data from Open-Meteo API
+bash scripts/run_ingest_bronze.sh --mode full
+
+# Silver: Clean and transform Bronze data
+bash scripts/run_silver_pipeline.sh --mode full
+
+# Gold: Load dimensions and transform facts
+bash scripts/run_gold_pipeline.sh --mode all        # All (dims + facts)
+bash scripts/run_gold_pipeline.sh --mode dims       # Dimensions only
+bash scripts/run_gold_pipeline.sh --mode facts      # Facts only
+```
+
+### Data Quality Validation
+```bash
+# Validate all layers
+python3 scripts/validate/validate_all.py
+
+# Validate specific layer
+python3 scripts/validate/validate_bronze.py
+python3 scripts/validate/validate_silver.py
+python3 scripts/validate/validate_gold.py
+
+# Export results to JSON
+python3 scripts/validate/validate_all.py --output results.json
+```
+
+### Prefect Integration
+```bash
+# Run validation flow
+python flows/validation_flow.py
+
+# Deploy to Prefect server
+prefect deployment build flows/validation_flow.py:validate_data_quality -n daily-validation
+prefect deployment apply validate_data_quality-deployment.yaml
+```
 
 ## Operational Checklist
 
-- [ ] Run `./scripts/health_check.sh` after any system updates.
+- [x] Bronze ingestion pipeline implemented and validated
+- [x] Silver transformation pipeline implemented and validated
+- [x] Gold dimensions loaded (location, pollutant, time, date)
+- [x] Gold facts implemented (hourly, daily, episode)
+- [x] Comprehensive validation framework for all layers
+- [x] Prefect-ready task wrappers
+- [x] Documentation for all layers and validation
+- [ ] Run `./scripts/health_check.sh` after system updates
 - [ ] Leave HDFS safe mode if ingest jobs need write access:
   ```bash
   hdfs dfsadmin -safemode leave

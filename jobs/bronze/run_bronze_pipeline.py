@@ -29,7 +29,6 @@ except ImportError:
     print("ERROR: pip install openmeteo-requests pandas requests-cache retry-requests")
     sys.exit(1)
 
-
 BRONZE_SCHEMA = StructType([
     StructField("location_key", StringType(), False),
     StructField("ts_utc", TimestampType(), False),
@@ -65,16 +64,53 @@ def build_spark_session(app_name: str = "ingest_bronze") -> SparkSession:
     return spark_session.build(app_name=app_name, mode=mode)
 
 
-def load_locations(path: str) -> List[Dict]:
-    with open(path, "r") as f:
-        content = f.read().strip()
-    
-    if content.startswith('{') and '\n' in content:
-        return [json.loads(line) for line in content.splitlines() if line.strip()]
-    
-    data = json.loads(content)
-    return data if isinstance(data, list) else data.get("locations", [])
+def load_locations(path: str, spark: Optional[SparkSession] = None) -> List[Dict]:
+    """Load locations from local file or HDFS (JSON or JSONL).
 
+    If `path` is an HDFS path (starts with hdfs:// or /user/), Spark must be provided
+    and will be used to read the file content.
+    """
+    is_hdfs = path.startswith("hdfs://") or path.startswith("/user/") or path.startswith("hdfs:")
+
+    if is_hdfs:
+        if spark is None:
+            raise ValueError("Spark session required to read from HDFS; pass spark to load_locations")
+        # read as text lines (works for JSONL or single JSON)
+        try:
+            rows = spark.read.text(path).collect()
+            lines = [r.value for r in rows if getattr(r, 'value', None) and r.value.strip()]
+            content = "\n".join(lines)
+        except Exception as e:
+            raise RuntimeError(f"Failed to read locations from HDFS {path}: {e}")
+    else:
+        with open(path, "r") as f:
+            content = f.read().strip()
+
+    # JSONL: one JSON object per line
+    if content.startswith('{') and '\n' in content:
+        locations = []
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                locations.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        if locations:
+            return locations
+
+    # JSON format
+    try:
+        data = json.loads(content)
+        if isinstance(data, list):
+            return data
+        elif isinstance(data, dict) and "locations" in data:
+            return data["locations"]
+        else:
+            raise ValueError(f"Invalid JSON format in {path}")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse {path}: {e}")
 
 def get_latest_timestamp(spark: SparkSession, table: str, location_key: str) -> Optional[datetime]:
     try:
@@ -82,7 +118,6 @@ def get_latest_timestamp(spark: SparkSession, table: str, location_key: str) -> 
         return result[0]["max_ts"] if result and result[0]["max_ts"] else None
     except:
         return None
-
 
 def fetch_openmeteo_data(lat: float, lon: float, start: str, end: str) -> Optional[pd.DataFrame]:
     cache = requests_cache.CachedSession('.cache', expire_after=3600)
@@ -232,7 +267,6 @@ def run_backfill(spark: SparkSession, locations: List[Dict], start: str, end: st
     
     return {"total_rows": total_rows, "total_chunks": len(locations) * len(chunks)}
 
-
 def run_upsert(spark: SparkSession, locations: List[Dict], table: str, 
                lookback_days: int = 7) -> Dict:
     """
@@ -279,7 +313,6 @@ def run_upsert(spark: SparkSession, locations: List[Dict], table: str,
     print(f"\nUpsert summary: {locations_with_data}/{len(locations)} locations had existing data")
     return {"total_rows": total_rows, "locations_processed": locations_with_data}
 
-
 def execute_ingestion(mode: str, locations_path: str, start_date: Optional[str] = None,
                       end_date: Optional[str] = None, chunk_days: int = 90, 
                       lookback_days: int = 7, override: bool = False,
@@ -287,38 +320,40 @@ def execute_ingestion(mode: str, locations_path: str, start_date: Optional[str] 
                       warehouse: str = "hdfs://khoa-master:9000/warehouse/iceberg") -> Dict:
     """Prefect-friendly ingestion function."""
     try:
-        locations = load_locations(locations_path)
-        print(f"Loaded {len(locations)} locations")
-        
+        # Build Spark session early so load_locations can read from HDFS if needed
         spark = build_spark_session()
         spark.conf.set("spark.sql.catalog.hadoop_catalog.warehouse", warehouse)
-        
+
+        locations = load_locations(locations_path, spark=spark)
+        print(f"Loaded {len(locations)} locations")
+
         start_time = time.time()
-        
+
         if mode == "backfill":
-            stats = run_backfill(spark, locations, start_date, 
-                               end_date or datetime.now().strftime("%Y-%m-%d"), 
-                               table, chunk_days, override)
+            stats = run_backfill(
+                spark, locations, start_date,
+                end_date or datetime.now().strftime("%Y-%m-%d"),
+                table, chunk_days, override,
+            )
         else:
             stats = run_upsert(spark, locations, table, lookback_days)
-        
+
         elapsed = time.time() - start_time
-        
-        print(f"\nCOMPLETE: {stats['total_rows']} rows in {elapsed:.1f}s")
-        
+
+        print(f"\nCOMPLETE: {stats.get('total_rows', 0)} rows in {elapsed:.1f}s")
+
         try:
             count = spark.sql(f"SELECT COUNT(*) as cnt FROM {table}").collect()[0]["cnt"]
             print(f"Total in table: {count}")
-        except:
+        except Exception:
             pass
-        
+
         spark.stop()
-        
+
         return {"success": True, "stats": stats, "elapsed_seconds": elapsed}
     except Exception as e:
         print(f"ERROR: {e}")
         return {"success": False, "error": str(e)}
-
 
 def main():
     parser = argparse.ArgumentParser(description="Optimized Bronze Ingestion")
@@ -350,7 +385,6 @@ def main():
     )
     
     sys.exit(0 if result["success"] else 1)
-
 
 if __name__ == "__main__":
     main()
