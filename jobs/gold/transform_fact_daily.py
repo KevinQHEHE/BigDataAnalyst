@@ -58,13 +58,73 @@ def build_spark_session(app_name: str = "transform_fact_daily") -> SparkSession:
     return spark
 
 
+def get_new_data_range(
+    spark: SparkSession,
+    hourly_table: str,
+    daily_table: str
+) -> tuple:
+    """Auto-detect date range of new data in hourly fact that's not in daily fact yet.
+    
+    Returns:
+        (start_date, end_date): Date strings in 'YYYY-MM-DD' format
+        (None, None): If daily table is empty (need full load)
+        ("NO_NEW_DATA", "NO_NEW_DATA"): If no new data
+    """
+    try:
+        # Check if daily table exists
+        daily_exists = spark.catalog.tableExists(daily_table)
+        if not daily_exists:
+            print(f"⊘ Daily table {daily_table} doesn't exist, will process all hourly data")
+            return None, None
+        
+        # Get max date_key in daily table
+        daily_max_row = spark.sql(f"""
+            SELECT MAX(date_key) as max_date_key 
+            FROM {daily_table}
+        """).collect()
+        
+        if not daily_max_row or daily_max_row[0]['max_date_key'] is None:
+            print("⊘ Daily table is empty, will process all hourly data")
+            return None, None
+        
+        daily_max_date_key = daily_max_row[0]['max_date_key']
+        print(f"✓ Latest daily date_key: {daily_max_date_key}")
+        
+        # Get min/max dates in hourly where date_key > daily_max
+        hourly_new_row = spark.sql(f"""
+            SELECT 
+                MIN(date_utc) as min_date,
+                MAX(date_utc) as max_date,
+                COUNT(*) as count
+            FROM {hourly_table}
+            WHERE date_key > {daily_max_date_key}
+        """).collect()
+        
+        if not hourly_new_row or hourly_new_row[0]['min_date'] is None:
+            print("✓ No new data in hourly facts, daily is up-to-date")
+            return "NO_NEW_DATA", "NO_NEW_DATA"
+        
+        min_date = str(hourly_new_row[0]['min_date'])
+        max_date = str(hourly_new_row[0]['max_date'])
+        new_count = hourly_new_row[0]['count']
+        
+        print(f"↻ Found {new_count} new hourly records: {min_date} to {max_date}")
+        return min_date, max_date
+        
+    except Exception as e:
+        print(f"⚠ Error detecting new data range: {e}")
+        print("  Will process all hourly data")
+        return None, None
+
+
 def transform_fact_daily(
     spark: SparkSession,
     hourly_table: str = "hadoop_catalog.lh.gold.fact_air_quality_hourly",
     daily_table: str = "hadoop_catalog.lh.gold.fact_city_daily",
     start_date: str = None,
     end_date: str = None,
-    mode: str = "overwrite"
+    mode: str = "overwrite",
+    auto_detect: bool = True  # Auto-detect new data range if start_date not provided
 ) -> dict:
     """Aggregate hourly facts to daily city facts.
     
@@ -75,6 +135,7 @@ def transform_fact_daily(
         start_date: Optional start date filter (YYYY-MM-DD)
         end_date: Optional end date filter (YYYY-MM-DD)
         mode: Write mode - "overwrite" or "merge"
+        auto_detect: Auto-detect new data range if True and start_date not provided
     
     Returns:
         Dictionary with processing metrics
@@ -84,14 +145,32 @@ def transform_fact_daily(
     print(f"Reading from hourly fact table: {hourly_table}")
     print(f"Write mode: {mode}")
     
+    # Auto-detect new data range for merge mode
+    if auto_detect and mode == "merge" and not start_date:
+        print("\n🔍 Auto-detecting new data range...")
+        start_date, end_date = get_new_data_range(spark, hourly_table, daily_table)
+        
+        if start_date == "NO_NEW_DATA":
+            return {
+                "status": "skipped",
+                "reason": "no_new_data",
+                "records_processed": 0,
+                "duration_seconds": 0
+            }
+    
     # Read hourly data
     query = f"SELECT * FROM {hourly_table}"
     if start_date and end_date:
         query += f" WHERE date_utc BETWEEN '{start_date}' AND '{end_date}'"
+        print(f"Date range: {start_date} to {end_date}")
     elif start_date:
         query += f" WHERE date_utc >= '{start_date}'"
+        print(f"Start date: {start_date}")
     elif end_date:
         query += f" WHERE date_utc <= '{end_date}'"
+        print(f"End date: {end_date}")
+    else:
+        print("Processing all hourly data")
     
     df_hourly = spark.sql(query)
     

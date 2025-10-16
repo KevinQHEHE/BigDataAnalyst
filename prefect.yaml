@@ -1,0 +1,65 @@
+# Prefect Deployment Configuration
+name: dlh-aqi-pipeline
+version: 1.0.0
+
+# Define deployments
+deployments:
+  # Hourly pipeline - runs every hour
+  - name: hourly-aqi-pipeline
+    entrypoint: Prefect/full_pipeline_flow.py:hourly_pipeline_flow
+    schedule:
+      cron: "0 * * * *"  # Every hour at minute 0
+      timezone: "Asia/Ho_Chi_Minh"
+    parameters:
+      warehouse: "hdfs://khoa-master:9000/warehouse/iceberg"
+      require_yarn: true
+    work_pool:
+      name: default
+    description: "Hourly AQI data pipeline - Bronze -> Silver -> Gold (auto-detect optimization enabled)"
+    tags:
+      - aqi
+      - hourly
+      - production
+
+  # Daily full pipeline - runs at 1 AM every day
+  - name: daily-full-pipeline
+    entrypoint: Prefect/full_pipeline_flow.py:full_pipeline_flow
+    schedule:
+      cron: "0 1 * * *"  # Every day at 1:00 AM
+      timezone: "Asia/Ho_Chi_Minh"
+    parameters:
+      bronze_mode: "upsert"
+      silver_mode: "incremental"
+      gold_mode: "all"
+      warehouse: "hdfs://khoa-master:9000/warehouse/iceberg"
+      require_yarn: true
+    work_pool:
+      name: default
+    description: "Daily full AQI data pipeline with auto-detect optimization"
+    tags:
+      - aqi
+      - daily
+      - production
+
+  # Backfill on demand - no schedule
+  - name: backfill-pipeline
+    entrypoint: Prefect/backfill_flow.py:backfill_pipeline_flow
+    parameters:
+      start_date: "2025-01-01"
+      end_date: "2025-01-31"
+      bronze_mode: "backfill"
+      warehouse: "hdfs://khoa-master:9000/warehouse/iceberg"
+      require_yarn: true
+    work_pool:
+      name: default
+    description: "On-demand backfill for specific date ranges"
+    tags:
+      - aqi
+      - backfill
+      - manual
+
+# Build configuration for dependencies
+build: null
+
+# Pull configuration for code storage
+pull: null

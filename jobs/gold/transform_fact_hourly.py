@@ -55,13 +55,73 @@ def build_spark_session(app_name: str = "transform_fact_hourly") -> SparkSession
     return spark
 
 
+def get_new_data_range(
+    spark: SparkSession,
+    silver_table: str,
+    gold_table: str
+) -> tuple:
+    """Auto-detect date range of new data in Silver that's not in Gold yet.
+    
+    Returns:
+        (start_date, end_date): Date strings in 'YYYY-MM-DD' format
+        (None, None): If Gold is empty (need full load)
+        ("NO_NEW_DATA", "NO_NEW_DATA"): If no new data
+    """
+    try:
+        # Check if Gold table exists
+        gold_exists = spark.catalog.tableExists(gold_table)
+        if not gold_exists:
+            print(f"⊘ Gold table {gold_table} doesn't exist, will process all Silver data")
+            return None, None
+        
+        # Get max timestamp in Gold
+        gold_max_row = spark.sql(f"""
+            SELECT MAX(ts_utc) as max_ts 
+            FROM {gold_table}
+        """).collect()
+        
+        if not gold_max_row or gold_max_row[0]['max_ts'] is None:
+            print("⊘ Gold table is empty, will process all Silver data")
+            return None, None
+        
+        gold_max_ts = gold_max_row[0]['max_ts']
+        print(f"✓ Latest Gold timestamp: {gold_max_ts}")
+        
+        # Get min/max dates in Silver where ts_utc > gold_max
+        silver_new_row = spark.sql(f"""
+            SELECT 
+                MIN(date_utc) as min_date,
+                MAX(date_utc) as max_date,
+                COUNT(*) as count
+            FROM {silver_table}
+            WHERE ts_utc > '{gold_max_ts}'
+        """).collect()
+        
+        if not silver_new_row or silver_new_row[0]['min_date'] is None:
+            print("✓ No new data in Silver, Gold is up-to-date")
+            return "NO_NEW_DATA", "NO_NEW_DATA"
+        
+        min_date = str(silver_new_row[0]['min_date'])
+        max_date = str(silver_new_row[0]['max_date'])
+        new_count = silver_new_row[0]['count']
+        
+        print(f"↻ Found {new_count} new records in Silver: {min_date} to {max_date}")
+        return min_date, max_date
+        
+    except Exception as e:
+        print(f"⚠ Error detecting new data range: {e}")
+        print("  Will process all Silver data")
+        return None, None
+
+
 def transform_fact_hourly(
     spark: SparkSession,
     silver_table: str = "hadoop_catalog.lh.silver.air_quality_hourly_clean",
     gold_table: str = "hadoop_catalog.lh.gold.fact_air_quality_hourly",
     start_date: str = None,
     end_date: str = None,
-    mode: str = "overwrite"  # "overwrite" or "merge"
+    mode: str = "overwrite",  # "overwrite" or "merge"
+    auto_detect: bool = True  # Auto-detect new data range if start_date not provided
 ) -> dict:
     """Transform silver to gold fact hourly with enrichments.
     
@@ -72,6 +132,7 @@ def transform_fact_hourly(
         start_date: Optional start date filter (YYYY-MM-DD)
         end_date: Optional end date filter (YYYY-MM-DD)
         mode: Write mode - "overwrite" (replace all) or "merge" (upsert)
+        auto_detect: Auto-detect new data range if True and start_date not provided
     
     Returns:
         Dictionary with processing metrics
@@ -81,14 +142,32 @@ def transform_fact_hourly(
     print(f"Reading from silver table: {silver_table}")
     print(f"Write mode: {mode}")
     
+    # Auto-detect new data range for merge mode
+    if auto_detect and mode == "merge" and not start_date:
+        print("\n🔍 Auto-detecting new data range...")
+        start_date, end_date = get_new_data_range(spark, silver_table, gold_table)
+        
+        if start_date == "NO_NEW_DATA":
+            return {
+                "status": "skipped",
+                "reason": "no_new_data",
+                "records_processed": 0,
+                "duration_seconds": 0
+            }
+    
     # Read silver data
     query = f"SELECT * FROM {silver_table}"
     if start_date and end_date:
         query += f" WHERE date_utc BETWEEN '{start_date}' AND '{end_date}'"
+        print(f"Date range: {start_date} to {end_date}")
     elif start_date:
         query += f" WHERE date_utc >= '{start_date}'"
+        print(f"Start date: {start_date}")
     elif end_date:
         query += f" WHERE date_utc <= '{end_date}'"
+        print(f"End date: {end_date}")
+    else:
+        print("Processing all Silver data")
     
     df_silver = spark.sql(query)
     
