@@ -56,31 +56,38 @@ def run_pipeline_on_yarn_task(
     
     print(f"\nExecuting: {' '.join(cmd)}\n")
     
-    # Run command
+    # Run command with streaming output (reduces memory usage)
     start_time = datetime.now()
     
     try:
-        result = subprocess.run(
+        # Use Popen to stream output in real-time instead of buffering
+        process = subprocess.Popen(
             cmd,
             cwd=root_dir,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Merge stderr into stdout
             text=True,
-            timeout=3600  # 1 hour timeout
+            bufsize=1,  # Line buffered
+            universal_newlines=True
         )
         
+        # Stream output line by line (memory efficient)
+        output_lines = []
+        max_lines_to_keep = 100  # Keep only last 100 lines for error reporting
+        
+        for line in process.stdout:
+            print(line, end='')  # Print immediately without buffering
+            output_lines.append(line)
+            # Keep only recent lines to avoid memory growth
+            if len(output_lines) > max_lines_to_keep:
+                output_lines.pop(0)
+        
+        # Wait for process to complete (with timeout)
+        return_code = process.wait(timeout=3600)  # 1 hour timeout
         duration = (datetime.now() - start_time).total_seconds()
         
-        # Print output
-        if result.stdout:
-            print("STDOUT:")
-            print(result.stdout)
-        
-        if result.stderr:
-            print("STDERR:")
-            print(result.stderr)
-        
         # Check result
-        if result.returncode == 0:
+        if return_code == 0:
             print(f"\n{'='*80}")
             print(f"✓ Pipeline completed successfully in {duration:.1f}s")
             print(f"{'='*80}")
@@ -88,18 +95,25 @@ def run_pipeline_on_yarn_task(
             return {
                 "success": True,
                 "duration_seconds": duration,
-                "return_code": result.returncode,
+                "return_code": return_code,
                 "timestamp": datetime.now().isoformat()
             }
         else:
-            error_msg = f"Pipeline failed with return code {result.returncode}"
+            error_msg = f"Pipeline failed with return code {return_code}"
             print(f"\n{'='*80}")
             print(f"✗ {error_msg}")
+            print(f"Last {len(output_lines)} lines of output:")
+            print(''.join(output_lines))
             print(f"{'='*80}")
             
             raise RuntimeError(error_msg)
             
     except subprocess.TimeoutExpired:
+        # Kill process if still running
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        
         duration = (datetime.now() - start_time).total_seconds()
         error_msg = f"Pipeline timed out after {duration:.1f}s"
         print(f"\n{'='*80}")
@@ -108,6 +122,11 @@ def run_pipeline_on_yarn_task(
         raise RuntimeError(error_msg)
     
     except Exception as e:
+        # Kill process if still running
+        if 'process' in locals() and process.poll() is None:
+            process.kill()
+            process.wait()
+        
         duration = (datetime.now() - start_time).total_seconds()
         error_msg = f"Pipeline failed: {e}"
         print(f"\n{'='*80}")

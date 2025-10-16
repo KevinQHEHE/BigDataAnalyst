@@ -39,7 +39,8 @@ echo "Step 3: Deploying YARN wrapper flows..."
 echo ""
 
 # Deploy hourly pipeline
-echo "n" | prefect deploy Prefect/yarn_wrapper_flow.py:hourly_pipeline_yarn_flow \
+# Answer both prompts: "Would you like workers to pull code?" (n) and "Save config?" (n)
+printf "n\nn\n" | prefect deploy Prefect/yarn_wrapper_flow.py:hourly_pipeline_yarn_flow \
     --name "hourly-yarn-pipeline" \
     --cron "0 * * * *" \
     --pool default \
