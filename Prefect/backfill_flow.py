@@ -1,26 +1,13 @@
 """Prefect Backfill Flow: Optimized Historical Data Processing.
 
-This flow processes large date ranges by:
-- Spawning subprocess jobs with fresh JVM per stage
-- NO SparkSession reuse, NO Prefect overhead per chunk
+This flow processes large date ranges with:
+- Subprocess jobs with fresh JVM per stage
+- Each stage runs in a separate process with clean memory
 - Tracking progress and collecting metrics
 - Generating comprehensive summary report
 
-KEY DIFFERENCE from old backfill_flow.py:
-  OLD: bronze_flow -> silver_flow -> gold_flow (3 Prefect flows, 1 SparkSession)
-       - SparkSession reused across chunks
-       - Memory bloat from long-lived session
-       - Prefect overhead on each task
-       - Slow GC
-
-  NEW: spark-submit job1 -> spark-submit job2 -> spark-submit job3
-       - Fresh JVM for each job stage
-       - Clean memory + efficient GC
-       - No Prefect overhead per chunk
-       - 3-5x faster
-
 Usage (via YARN):
-  bash scripts/spark_submit.sh Prefect/backfill_flow_optimized.py -- \\
+  bash scripts/spark_submit.sh Prefect/backfill_flow.py -- \\
     --start-date 2024-01-01 \\
     --end-date 2024-12-31
 
@@ -30,13 +17,13 @@ Run via YARN:
 """
 import argparse
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 from prefect import flow
+
+from utils import run_subprocess_job
 
 # Setup paths
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -45,103 +32,13 @@ SRC_DIR = ROOT_DIR / "src"
 for path in [SRC_DIR]:
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
-
 from dotenv import load_dotenv
 load_dotenv(ROOT_DIR / ".env")
 
 
-def run_subprocess_job(
-    script_path: str,
-    args: List[str],
-    job_name: str = "job",
-    timeout: int = 3600
-) -> Tuple[bool, Dict]:
-    """Run a Spark job as subprocess with fresh JVM.
-    
-    Args:
-        script_path: Relative path to script (e.g., "jobs/bronze/run_bronze_pipeline.py")
-        args: Command-line arguments
-        job_name: Name for logging
-        timeout: Timeout in seconds
-        
-    Returns:
-        (success: bool, result: dict)
-    """
-    start_time = time.time()
-    script_full = ROOT_DIR / script_path
-    
-    if not script_full.exists():
-        return False, {"error": f"Script not found: {script_full}"}
-    
-    cmd = [
-        "bash",
-        str(ROOT_DIR / "scripts/spark_submit.sh"),
-        str(script_path),
-        "--"
-    ] + args
-    
-    print(f"\n[{job_name}] Starting subprocess (fresh JVM)...")
-    print(f"[{job_name}] Command: {' '.join(cmd[-4:])}")
-    print(f"[{job_name}] Output:")
-    print("-" * 80)
-    sys.stdout.flush()
-    
-    try:
-        # Use Popen for real-time output streaming (prevents Prefect lag)
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(ROOT_DIR),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1  # Line buffered for real-time output
-        )
-        
-        # Stream output line by line
-        for line in process.stdout:
-            print(line, end='', flush=True)  # Explicit flush for Prefect logging
-        
-        # Wait for process to complete
-        return_code = process.wait(timeout=timeout)
-        elapsed = time.time() - start_time
-        print("-" * 80)
-        sys.stdout.flush()
-        
-        if return_code == 0:
-            print(f"[{job_name}] SUCCESS ({elapsed:.1f}s)")
-            return True, {
-                "success": True,
-                "elapsed_seconds": elapsed
-            }
-        else:
-            print(f"[{job_name}] FAILED (exit {return_code})")
-            return False, {
-                "success": False,
-                "exit_code": return_code,
-                "elapsed_seconds": elapsed
-            }
-    
-    except subprocess.TimeoutExpired:
-        print("-" * 80)
-        print(f"[{job_name}] TIMEOUT ({timeout}s)")
-        return False, {
-            "success": False,
-            "error": f"Timeout after {timeout}s",
-            "elapsed_seconds": timeout
-        }
-    except Exception as e:
-        print("-" * 80)
-        print(f"[{job_name}] EXCEPTION: {e}")
-        return False, {
-            "success": False,
-            "error": str(e),
-            "elapsed_seconds": time.time() - start_time
-        }
-
-
 @flow(
-    name="Backfill Flow Optimized",
-    description="Optimized backfill with subprocess jobs (fresh JVM per stage)",
+    name="Backfill Flow",
+    description="Backfill with subprocess jobs",
     log_prints=True
 )
 def backfill_flow(
@@ -151,9 +48,8 @@ def backfill_flow(
     skip_silver: bool = False,
     skip_gold: bool = False,
     locations_path: str = "hdfs://khoa-master:9000/user/dlhnhom2/data/locations.jsonl",
-    pollutants_path: str = "hdfs://khoa-master:9000/user/dlhnhom2/data/dim_pollutant.jsonl",
-    warehouse: str = "hdfs://khoa-master:9000/warehouse/iceberg"
-) -> Dict:
+    pollutants_path: str = "hdfs://khoa-master:9000/user/dlhnhom2/data/dim_pollutant.jsonl"
+) -> dict:
     """Execute optimized backfill with subprocess jobs.
     
     This replaces the old backfill_flow.py with a simpler approach:
@@ -178,7 +74,6 @@ def backfill_flow(
     print("BACKFILL FLOW - OPTIMIZED (subprocess jobs)")
     print("="*80)
     print(f"Date range: {start_date} to {end_date}")
-    print(f"Warehouse: {warehouse}")
     
     stages = []
     if not skip_bronze:
@@ -219,7 +114,7 @@ def backfill_flow(
             "jobs/bronze/run_bronze_pipeline.py",
             bronze_args,
             "Bronze",
-            timeout=7200  # 2 hours
+            timeout=1200  # 20 minutes
         )
         
         results["stages"]["bronze"] = bronze_result
@@ -242,7 +137,7 @@ def backfill_flow(
             "jobs/silver/run_silver_pipeline.py",
             silver_args,
             "Silver",
-            timeout=7200
+            timeout=1200
         )
         
         results["stages"]["silver"] = silver_result
@@ -267,7 +162,7 @@ def backfill_flow(
             "jobs/gold/run_gold_pipeline.py",
             gold_args,
             "Gold",
-            timeout=3600
+            timeout=1600
         )
         
         results["stages"]["gold"] = gold_result

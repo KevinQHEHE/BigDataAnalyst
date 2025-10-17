@@ -167,32 +167,6 @@ def hourly_pipeline_yarn_flow() -> Dict:
     return result
 
 
-@flow(
-    name="Full Pipeline on YARN",
-    description="Runs full AQI pipeline on YARN via spark-submit",
-    log_prints=True,
-    retries=1,
-    retry_delay_seconds=600
-)
-def full_pipeline_yarn_flow() -> Dict:
-    """Execute full pipeline on YARN cluster.
-    
-    Returns:
-        Dictionary with pipeline execution results
-    """
-    print("="*80)
-    print("PREFECT FULL PIPELINE (YARN MODE)")
-    print(f"Started: {datetime.now().isoformat()}")
-    print("="*80)
-    
-    result = run_pipeline_on_yarn_task(
-        flow_script="Prefect/full_pipeline_flow.py",
-        mode="full"
-    )
-    
-    return result
-
-
 if __name__ == "__main__":
     # Test run
     hourly_pipeline_yarn_flow()

@@ -1,9 +1,9 @@
 """Prefect Flows for DLH-AQI Pipeline.
 
 This package contains Prefect orchestration flows for the complete AQI data pipeline:
-- Bronze: Data ingestion from Open-Meteo API
-- Silver: Data transformation and enrichment
-- Gold: Dimensional modeling and aggregation
+- Full Pipeline: Complete Bronze → Silver → Gold pipeline
+- Backfill: Historical data backfilling
+- YARN Wrapper: Scheduled execution via YARN cluster
 
 All flows are designed to run on YARN via spark_submit.sh wrapper.
 """
@@ -11,11 +11,9 @@ All flows are designed to run on YARN via spark_submit.sh wrapper.
 __version__ = "1.0.0"
 
 __all__ = [
-    "bronze_flow",
-    "silver_flow",
-    "gold_flow",
     "full_pipeline_flow",
     "backfill_flow",
+    "yarn_wrapper_flow",
     "spark_context",
-    "deploy"
+    "utils",
 ]
