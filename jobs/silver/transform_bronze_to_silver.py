@@ -36,7 +36,7 @@ load_dotenv(os.path.join(ROOT_DIR, ".env"))
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, date_format, hour, year, month, dayofmonth,
-    concat, lpad, cast
+    concat, lpad, cast, max as spark_max, min as spark_min
 )
 
 
@@ -49,13 +49,73 @@ def build_spark_session(app_name: str = "transform_bronze_to_silver") -> SparkSe
         return spark_session.build(app_name=app_name, mode="local")
 
 
+def get_new_data_range(
+    spark: SparkSession,
+    bronze_table: str,
+    silver_table: str
+) -> tuple:
+    """Auto-detect date range of new data in Bronze that's not in Silver yet.
+    
+    Returns:
+        (start_date, end_date): Date strings in 'YYYY-MM-DD' format
+        (None, None): If Silver is empty (need full load)
+        ("NO_NEW_DATA", "NO_NEW_DATA"): If no new data
+    """
+    try:
+        # Check if Silver table exists
+        silver_exists = spark.catalog.tableExists(silver_table)
+        if not silver_exists:
+            print(f"⊘ Silver table {silver_table} doesn't exist, will process all Bronze data")
+            return None, None
+        
+        # Get max timestamp in Silver
+        silver_max_row = spark.sql(f"""
+            SELECT MAX(ts_utc) as max_ts 
+            FROM {silver_table}
+        """).collect()
+        
+        if not silver_max_row or silver_max_row[0]['max_ts'] is None:
+            print("⊘ Silver table is empty, will process all Bronze data")
+            return None, None
+        
+        silver_max_ts = silver_max_row[0]['max_ts']
+        print(f"✓ Latest Silver timestamp: {silver_max_ts}")
+        
+        # Get min/max dates in Bronze where ts_utc > silver_max
+        bronze_new_row = spark.sql(f"""
+            SELECT 
+                MIN(date_utc) as min_date,
+                MAX(date_utc) as max_date,
+                COUNT(*) as count
+            FROM {bronze_table}
+            WHERE ts_utc > '{silver_max_ts}'
+        """).collect()
+        
+        if not bronze_new_row or bronze_new_row[0]['min_date'] is None:
+            print("✓ No new data in Bronze, Silver is up-to-date")
+            return "NO_NEW_DATA", "NO_NEW_DATA"
+        
+        min_date = str(bronze_new_row[0]['min_date'])
+        max_date = str(bronze_new_row[0]['max_date'])
+        new_count = bronze_new_row[0]['count']
+        
+        print(f"↻ Found {new_count} new records in Bronze: {min_date} to {max_date}")
+        return min_date, max_date
+        
+    except Exception as e:
+        print(f"⚠ Error detecting new data range: {e}")
+        print("  Will process all Bronze data")
+        return None, None
+
+
 def transform_bronze_to_silver(
     spark: SparkSession,
     bronze_table: str = "hadoop_catalog.lh.bronze.open_meteo_hourly",
     silver_table: str = "hadoop_catalog.lh.silver.air_quality_hourly_clean",
     start_date: str = None,
     end_date: str = None,
-    mode: str = "merge"  # "merge", "overwrite", or "append"
+    mode: str = "merge",  # "merge", "overwrite", or "append"
+    auto_detect: bool = True  # Auto-detect new data range if start_date not provided
 ) -> dict:
     """Transform bronze data to silver with enrichments.
     
@@ -66,6 +126,7 @@ def transform_bronze_to_silver(
         start_date: Optional start date filter (YYYY-MM-DD)
         end_date: Optional end date filter (YYYY-MM-DD)
         mode: Write mode - "merge" (upsert), "overwrite" (replace all), "append" (add only)
+        auto_detect: Auto-detect new data range if True and start_date not provided
     
     Returns:
         Dictionary with processing metrics
@@ -76,14 +137,32 @@ def transform_bronze_to_silver(
     print(f"Reading from bronze table: {bronze_table}")
     print(f"Write mode: {mode}")
     
+    # Auto-detect new data range for merge mode
+    if auto_detect and mode == "merge" and not start_date:
+        print("\n🔍 Auto-detecting new data range...")
+        start_date, end_date = get_new_data_range(spark, bronze_table, silver_table)
+        
+        if start_date == "NO_NEW_DATA":
+            return {
+                "status": "skipped",
+                "reason": "no_new_data",
+                "records_processed": 0,
+                "duration_seconds": 0
+            }
+    
     # Read bronze data
     query = f"SELECT * FROM {bronze_table}"
     if start_date and end_date:
         query += f" WHERE date_utc BETWEEN '{start_date}' AND '{end_date}'"
+        print(f"Date range: {start_date} to {end_date}")
     elif start_date:
         query += f" WHERE date_utc >= '{start_date}'"
+        print(f"Start date: {start_date}")
     elif end_date:
         query += f" WHERE date_utc <= '{end_date}'"
+        print(f"End date: {end_date}")
+    else:
+        print("Processing all Bronze data")
     
     df_bronze = spark.sql(query)
     
