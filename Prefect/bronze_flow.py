@@ -13,11 +13,10 @@ Usage (via YARN):
 DO NOT run directly with python - use spark_submit.sh wrapper for YARN deployment.
 """
 import argparse
-import json
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -26,9 +25,8 @@ from prefect import flow, task
 # Setup paths
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT_DIR / "src"
-JOBS_DIR = ROOT_DIR / "jobs"
 
-for path in [SRC_DIR, JOBS_DIR]:
+for path in [SRC_DIR]:
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
@@ -125,35 +123,6 @@ def ingest_location_chunk_task(
         "start_date": start_date,
         "end_date": end_date
     }
-
-
-@task(
-    name="Get Latest Timestamp",
-    description="Find latest timestamp for a location in bronze table",
-    log_prints=True
-)
-def get_latest_timestamp_task(location: Dict, table: str) -> Optional[str]:
-    """Get latest timestamp for a location.
-    
-    Args:
-        location: Location dictionary
-        table: Bronze table name
-        
-    Returns:
-        Latest timestamp as string or None
-    """
-    from bronze.run_bronze_pipeline import get_latest_timestamp
-    from pyspark.sql import SparkSession
-    
-    spark = SparkSession.builder.getOrCreate()
-    
-    loc_key = location.get("location_key") or location.get("id") or location.get("name")
-    
-    latest = get_latest_timestamp(spark, table, loc_key)
-    
-    if latest:
-        return latest.strftime("%Y-%m-%d %H:%M:%S")
-    return None
 
 
 @flow(
@@ -260,8 +229,11 @@ def bronze_ingestion_flow(
                     time.sleep(1)
         
         else:  # upsert mode
-            # Upsert mode: update from latest to today
-            today = datetime.now().strftime("%Y-%m-%d")
+            # Upsert mode: update from latest timestamp to now (hourly incremental)
+            from bronze.run_bronze_pipeline import get_latest_timestamp
+            
+            now = datetime.now()
+            current_date = now.strftime("%Y-%m-%d")
             locations_updated = 0
             
             for location in locations:
@@ -269,28 +241,34 @@ def bronze_ingestion_flow(
                 loc_name = location.get("location_name") or location.get("name", "Unknown")
                 
                 # Get latest timestamp
-                latest_str = get_latest_timestamp_task(location, table)
-                
-                if not latest_str:
-                    print(f"⊘ {loc_name}: No existing data, skipping upsert")
+                latest = get_latest_timestamp(spark, table, loc_key)
+                if not latest:
+                    print(f"No existing data, skipping upsert: {loc_name}")
                     continue
                 
-                latest_date = latest_str.split()[0]
-                print(f"↻ {loc_name}: Latest {latest_date}")
+                latest_str = latest.strftime("%Y-%m-%d %H:%M:%S")
+                latest_ts = datetime.strptime(latest_str, "%Y-%m-%d %H:%M:%S")
+                print(f"↻ {loc_name}: Latest {latest_str}")
                 
-                if latest_date >= today:
-                    print(f"  ✓ Already up to date")
+                # Check if we're already up to date
+                # Use absolute value to handle timezone issues
+                hours_diff = abs((now - latest_ts).total_seconds() / 3600)
+                
+                if hours_diff < 1:  # Less than 1 hours difference
+                    print(f"  ✓ Already up to date ({hours_diff:.1f}h from now)")
                     continue
                 
-                # Calculate next day
-                latest_dt = datetime.strptime(latest_date, "%Y-%m-%d")
-                next_day = (latest_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+                # Calculate date range to ingest
+                # For incremental hourly mode, only fetch current date to minimize API calls
+                # The filtering logic in run_bronze_pipeline will filter out existing timestamps
+                latest_date = latest_ts.strftime("%Y-%m-%d")
                 
-                # Ingest from next day to today
+                # Only ingest current date (today) for true hourly incremental behavior
+                # This reduces unnecessary API calls for yesterday's data which already exists
                 result = ingest_location_chunk_task(
                     location=location,
-                    start_date=next_day,
-                    end_date=today,
+                    start_date=current_date,  # Only fetch today
+                    end_date=current_date,
                     table=table,
                     override=False
                 )

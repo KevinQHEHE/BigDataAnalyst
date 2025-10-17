@@ -201,18 +201,9 @@ def ingest_location_chunk(spark: SparkSession, location: Dict, start: str, end: 
     
     print(f"  {loc_name} ({start} to {end})")
     
-    if not override:
-        try:
-            count = spark.sql(f"""
-                SELECT COUNT(*) as cnt FROM {table}
-                WHERE location_key = '{loc_key}' 
-                AND date_utc BETWEEN '{start}' AND '{end}'
-            """).collect()[0]["cnt"]
-            if count > 0:
-                print(f"    Skipped (exists)")
-                return 0
-        except:
-            pass
+    # Note: Removed check for existing data to allow hourly incremental updates
+    # Iceberg's merge semantics will handle deduplication properly
+    # Previous logic checked by date which prevented hourly updates within the same day
     
     pdf = fetch_openmeteo_data(location.get("latitude"), location.get("longitude"), start, end)
     
@@ -223,6 +214,18 @@ def ingest_location_chunk(spark: SparkSession, location: Dict, start: str, end: 
     pdf["_ingested_at"] = pd.Timestamp.now(tz="UTC")
     pdf["ts_utc"] = pd.to_datetime(pdf["ts_utc"], utc=True)
     pdf["date_utc"] = pd.to_datetime(pdf["date_utc"])
+    
+    # Filter out future timestamps (Open-Meteo may return forecast data)
+    now_utc = pd.Timestamp.now(tz="UTC")
+    future_mask = pdf["ts_utc"] > now_utc
+    future_count = future_mask.sum()
+    if future_count > 0:
+        pdf = pdf[~future_mask]
+        print(f"    Filtered {future_count} future timestamps (forecast data)")
+    
+    if pdf.empty:
+        print(f"    No new data after filtering future timestamps")
+        return 0
     
     for col in ["aqi", "aqi_pm25", "aqi_pm10", "aqi_no2", "aqi_o3", "aqi_so2", "aqi_co"]:
         pdf[col] = pdf[col].round().astype('Int64')
@@ -242,8 +245,23 @@ def ingest_location_chunk(spark: SparkSession, location: Dict, start: str, end: 
                 WHERE location_key = '{loc_key}'
                 AND date_utc BETWEEN '{start}' AND '{end}'
             """)
+            sdf.write.format("iceberg").mode("append").save(table)
+        else:
+            # Use MERGE INTO for automatic deduplication (upsert mode)
+            # Create temp view for merge operation
+            temp_view = f"temp_{loc_key}_{int(time.time())}"
+            sdf.createOrReplaceTempView(temp_view)
+            
+            spark.sql(f"""
+                MERGE INTO {table} AS target
+                USING {temp_view} AS source
+                ON target.location_key = source.location_key 
+                   AND target.ts_utc = source.ts_utc
+                WHEN NOT MATCHED THEN INSERT *
+            """)
+            
+            spark.catalog.dropTempView(temp_view)
         
-        sdf.write.format("iceberg").mode("append").save(table)
         rows = len(pdf)
         print(f"    Inserted {rows} rows")
         return rows

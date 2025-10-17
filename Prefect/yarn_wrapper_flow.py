@@ -76,7 +76,7 @@ def run_pipeline_on_yarn_task(
         max_lines_to_keep = 100  # Keep only last 100 lines for error reporting
         
         for line in process.stdout:
-            print(line, end='')  # Print immediately without buffering
+            print(line, end='', flush=True)  # Explicit flush for Prefect logging
             output_lines.append(line)
             # Keep only recent lines to avoid memory growth
             if len(output_lines) > max_lines_to_keep:
@@ -89,7 +89,7 @@ def run_pipeline_on_yarn_task(
         # Check result
         if return_code == 0:
             print(f"\n{'='*80}")
-            print(f"✓ Pipeline completed successfully in {duration:.1f}s")
+            print(f"Pipeline completed successfully in {duration:.1f}s")
             print(f"{'='*80}")
             
             return {
@@ -101,7 +101,7 @@ def run_pipeline_on_yarn_task(
         else:
             error_msg = f"Pipeline failed with return code {return_code}"
             print(f"\n{'='*80}")
-            print(f"✗ {error_msg}")
+            print(f"Error: {error_msg}")
             print(f"Last {len(output_lines)} lines of output:")
             print(''.join(output_lines))
             print(f"{'='*80}")
@@ -117,7 +117,7 @@ def run_pipeline_on_yarn_task(
         duration = (datetime.now() - start_time).total_seconds()
         error_msg = f"Pipeline timed out after {duration:.1f}s"
         print(f"\n{'='*80}")
-        print(f"✗ {error_msg}")
+        print(f"Error: {error_msg}")
         print(f"{'='*80}")
         raise RuntimeError(error_msg)
     
@@ -130,7 +130,7 @@ def run_pipeline_on_yarn_task(
         duration = (datetime.now() - start_time).total_seconds()
         error_msg = f"Pipeline failed: {e}"
         print(f"\n{'='*80}")
-        print(f"✗ {error_msg}")
+        print(f"Error: {error_msg}")
         print(f"{'='*80}")
         raise
 

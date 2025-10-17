@@ -17,7 +17,6 @@ import argparse
 import os
 import sys
 import time
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -26,9 +25,8 @@ from prefect import flow, task
 # Setup paths
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT_DIR / "src"
-JOBS_DIR = ROOT_DIR / "jobs"
 
-for path in [SRC_DIR, JOBS_DIR]:
+for path in [SRC_DIR]:
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
@@ -91,10 +89,10 @@ def transform_bronze_to_silver_task(
         start_date=start_date,
         end_date=end_date,
         mode=write_mode,
-        auto_detect=True  # Enable auto-detection for incremental processing
+        auto_detect=True
     )
     
-    print(f"✓ Transformation complete")
+    print(f"Transformation complete")
     print(f"  Records processed: {result.get('records_processed', 0)}")
     print(f"  Duration: {result.get('duration_seconds', 0):.1f}s")
     
@@ -187,9 +185,9 @@ def validate_silver_task(
     print(f"  NULL location_key: {validation_result['location_key_nulls']}")
     
     if validation_result['validation_passed']:
-        print("✓ All validations passed")
+        print("All validations passed")
     else:
-        print("⚠️  WARNING: Validation issues detected!")
+        print("WARNING: Validation issues detected!")
     
     return validation_result
 

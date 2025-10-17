@@ -27,9 +27,8 @@ from prefect import flow, task
 # Setup paths
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT_DIR / "src"
-JOBS_DIR = ROOT_DIR / "jobs"
 
-for path in [SRC_DIR, JOBS_DIR]:
+for path in [SRC_DIR]:
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
@@ -56,7 +55,7 @@ def load_dim_location_task(locations_path: str) -> int:
     
     print(f"Loading dim_location from {locations_path}")
     count = load_dim_location(spark=spark, locations_path=locations_path)
-    print(f"✓ Loaded {count} locations")
+    print(f"Loaded {count} locations")
     
     return count
 
@@ -77,7 +76,7 @@ def load_dim_pollutant_task(pollutants_path: str) -> int:
     
     print(f"Loading dim_pollutant from {pollutants_path}")
     count = load_dim_pollutant(spark=spark, pollutants_path=pollutants_path)
-    print(f"✓ Loaded {count} pollutants")
+    print(f"Loaded {count} pollutants")
     
     return count
 
@@ -98,7 +97,7 @@ def generate_dim_time_task() -> int:
     
     print("Generating dim_time (24 hours)")
     count = generate_dim_time(spark=spark)
-    print(f"✓ Generated {count} time records")
+    print(f"Generated {count} time records")
     
     return count
 
@@ -119,7 +118,7 @@ def generate_dim_date_task() -> int:
     
     print("Generating dim_date from silver layer")
     count = generate_dim_date(spark=spark)
-    print(f"✓ Generated {count} date records")
+    print(f"Generated {count} date records")
     
     return count
 
@@ -142,9 +141,9 @@ def transform_fact_hourly_task(mode: str = "overwrite") -> Dict:
     result = transform_fact_hourly(
         spark=spark, 
         mode=mode,
-        auto_detect=True  # Enable auto-detection for incremental processing
+        auto_detect=True
     )
-    print(f"✓ Processed {result.get('records_processed', 0)} records")
+    print(f"Processed {result.get('records_processed', 0)} records")
     
     return result
 
@@ -167,9 +166,9 @@ def transform_fact_daily_task(mode: str = "overwrite") -> Dict:
     result = transform_fact_daily(
         spark=spark, 
         mode=mode,
-        auto_detect=True  # Enable auto-detection for incremental processing
+        auto_detect=True
     )
-    print(f"✓ Processed {result.get('records_processed', 0)} records")
+    print(f"Processed {result.get('records_processed', 0)} records")
     
     return result
 
@@ -199,7 +198,7 @@ def detect_episodes_task(
         min_hours=min_hours,
         mode=mode
     )
-    print(f"✓ Detected {result.get('episodes_detected', 0)} episodes")
+    print(f"Detected {result.get('episodes_detected', 0)} episodes")
     
     return result
 
