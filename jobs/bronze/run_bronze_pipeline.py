@@ -313,18 +313,12 @@ def run_upsert(spark: SparkSession, locations: List[Dict], table: str,
         
         locations_with_data += 1
         
-        # Backfill from latest date to today
-        latest_date = latest.strftime("%Y-%m-%d")
-        print(f"  {loc_name}: Latest data {latest_date}, updating to {today}")
+        # Upsert mode: Get full current day data (00:00 to now)
+        # This ensures we always have all data from today
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        print(f"  {loc_name}: Ingesting full current day data ({current_date})")
         
-        if latest_date >= today:
-            print(f"    Already up to date, skipping")
-            continue
-        
-        # Calculate start date (day after latest)
-        start = (latest + timedelta(days=1)).strftime("%Y-%m-%d")
-        
-        rows = ingest_location_chunk(spark, location, start, today, table, override=False)
+        rows = ingest_location_chunk(spark, location, current_date, current_date, table, override=False)
         total_rows += rows
         time.sleep(1)
     
