@@ -221,7 +221,7 @@ CREATE TABLE IF NOT EXISTS hadoop_catalog.lh.gold.fact_episode (
   peak_aqi            INT,
   hours_flagged       INT,
   dominant_pollutant  STRING,
-  rule_code           STRING       -- example: 'AQI>=151_4h'
+  rule_code           STRING       
 )
 USING PARQUET
 PARTITIONED BY (start_date_utc, location_key)
