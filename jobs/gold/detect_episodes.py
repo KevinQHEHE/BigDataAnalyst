@@ -218,18 +218,22 @@ def detect_episodes(
         df_episodes.write.format("iceberg").mode("overwrite").saveAsTable(episode_table)
     else:
         print(f"Merging into episode table: {episode_table}")
-        tmp_view = "__tmp_episodes"
-        df_episodes.createOrReplaceTempView(tmp_view)
+        # Materialize data as temp table instead of view to avoid Spark 4.0 MERGE bug
+        tmp_table = f"{episode_table}_staging"
+        df_episodes.write.format("iceberg").mode("overwrite").saveAsTable(tmp_table)
         
         merge_sql = f"""
         MERGE INTO {episode_table} AS target
-        USING {tmp_view} AS source
+        USING {tmp_table} AS source
         ON target.location_key = source.location_key 
            AND target.start_ts_utc = source.start_ts_utc
         WHEN MATCHED THEN UPDATE SET *
         WHEN NOT MATCHED THEN INSERT *
         """
         spark.sql(merge_sql)
+        
+        # Cleanup staging table
+        spark.sql(f"DROP TABLE IF EXISTS {tmp_table}")
     
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()

@@ -38,21 +38,14 @@ def run_pipeline_on_yarn_task(
     print(f"Timestamp: {datetime.now().isoformat()}")
     print(f"="*80)
     
-    # Build command
-    if mode == "hourly":
-        cmd = [
-            "bash", 
-            "scripts/spark_submit.sh",
-            flow_script,
-            "--",
-            "--hourly"
-        ]
-    else:
-        cmd = [
-            "bash",
-            "scripts/spark_submit.sh", 
-            flow_script
-        ]
+    # Build command - always use incremental mode for hourly pipeline
+    cmd = [
+        "bash", 
+        "scripts/spark_submit.sh",
+        flow_script,
+        "--",
+        "--mode", "incremental"
+    ]
     
     print(f"\nExecuting: {' '.join(cmd)}\n")
     

@@ -242,11 +242,17 @@ def transform_fact_daily(
         col("data_completeness")
     )
     
-    # Deduplicate (should be 1 row per location/date already)
-    df_daily = df_daily.dropDuplicates(["location_key", "date_utc"])
-    
     daily_count = df_daily.count()
     print(f"Generated {daily_count} daily records")
+    
+    # Deduplicate (should be 1 row per location/date already, but ensure no duplicates)
+    from pyspark.sql import Window
+    from pyspark.sql.functions import row_number
+    
+    window_spec = Window.partitionBy("location_key", "date_utc").orderBy(col("date_utc").desc())
+    df_daily = df_daily.withColumn("_row_num", row_number().over(window_spec)) \
+                       .filter(col("_row_num") == 1) \
+                       .drop("_row_num")
     
     # Write to daily fact table
     if mode == "overwrite":
@@ -254,18 +260,22 @@ def transform_fact_daily(
         df_daily.write.format("iceberg").mode("overwrite").saveAsTable(daily_table)
     else:
         print(f"Merging into daily fact table: {daily_table}")
-        tmp_view = "__tmp_fact_daily"
-        df_daily.createOrReplaceTempView(tmp_view)
+        # Materialize dedupped data as temp table instead of view to avoid Spark 4.0 bug
+        tmp_table = f"{daily_table}_staging"
+        df_daily.write.format("iceberg").mode("overwrite").saveAsTable(tmp_table)
         
         merge_sql = f"""
         MERGE INTO {daily_table} AS target
-        USING {tmp_view} AS source
+        USING {tmp_table} AS source
         ON target.location_key = source.location_key 
            AND target.date_utc = source.date_utc
         WHEN MATCHED THEN UPDATE SET *
         WHEN NOT MATCHED THEN INSERT *
         """
         spark.sql(merge_sql)
+        
+        # Cleanup staging table
+        spark.sql(f"DROP TABLE IF EXISTS {tmp_table}")
     
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
