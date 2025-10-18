@@ -74,7 +74,7 @@ def get_new_data_range(
         # Check if daily table exists
         daily_exists = spark.catalog.tableExists(daily_table)
         if not daily_exists:
-            print(f"⊘ Daily table {daily_table} doesn't exist, will process all hourly data")
+            print(f"Daily table {daily_table} doesn't exist, will process all hourly data")
             return None, None
         
         # Get max date_key in daily table
@@ -84,11 +84,11 @@ def get_new_data_range(
         """).collect()
         
         if not daily_max_row or daily_max_row[0]['max_date_key'] is None:
-            print("⊘ Daily table is empty, will process all hourly data")
+            print("Daily table is empty, will process all hourly data")
             return None, None
         
         daily_max_date_key = daily_max_row[0]['max_date_key']
-        print(f"✓ Latest daily date_key: {daily_max_date_key}")
+        print(f"Latest daily date_key: {daily_max_date_key}")
         
         # Get min/max dates in hourly where date_key > daily_max
         hourly_new_row = spark.sql(f"""
@@ -101,18 +101,18 @@ def get_new_data_range(
         """).collect()
         
         if not hourly_new_row or hourly_new_row[0]['min_date'] is None:
-            print("✓ No new data in hourly facts, daily is up-to-date")
+            print("No new data in hourly facts, daily is up-to-date")
             return "NO_NEW_DATA", "NO_NEW_DATA"
         
         min_date = str(hourly_new_row[0]['min_date'])
         max_date = str(hourly_new_row[0]['max_date'])
         new_count = hourly_new_row[0]['count']
         
-        print(f"↻ Found {new_count} new hourly records: {min_date} to {max_date}")
+        print(f"Found {new_count} new hourly records: {min_date} to {max_date}")
         return min_date, max_date
         
     except Exception as e:
-        print(f"⚠ Error detecting new data range: {e}")
+        print(f"Error detecting new data range: {e}")
         print("  Will process all hourly data")
         return None, None
 
