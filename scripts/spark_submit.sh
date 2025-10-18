@@ -32,6 +32,7 @@ done
 # Defaults tuned for YARN
 SPARK_CONF=(
   "--conf" "spark.dynamicAllocation.enabled=true"
+  "--conf" "spark.submit.deployMode=client"
   "--conf" "spark.sql.adaptive.enabled=true"
   "--conf" "spark.dynamicAllocation.minExecutors=1"
   "--conf" "spark.dynamicAllocation.maxExecutors=50"
