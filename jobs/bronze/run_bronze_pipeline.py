@@ -369,7 +369,7 @@ def execute_ingestion(mode: str, locations_path: str, start_date: Optional[str] 
 
 def main():
     parser = argparse.ArgumentParser(description="Optimized Bronze Ingestion")
-    parser.add_argument("--mode", choices=["backfill", "upsert"], required=True)
+    parser.add_argument("--mode", choices=["backfill", "incremental"], required=True)
     parser.add_argument("--locations", default=os.path.join(ROOT_DIR, "data", "locations.jsonl"))
     parser.add_argument("--start-date")
     parser.add_argument("--end-date")

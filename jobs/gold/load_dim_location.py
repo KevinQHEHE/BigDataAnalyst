@@ -91,8 +91,8 @@ def main():
     parser = argparse.ArgumentParser(description="Load dim_location from locations.jsonl")
     parser.add_argument(
         "--locations",
-        default=os.path.join(os.path.dirname(__file__), "..", "..", "data", "locations.jsonl"),
-        help="Path to locations.jsonl file"
+        default="hdfs://khoa-master:9000/user/dlhnhom2/data/locations.jsonl",
+        help="Path to locations.jsonl file (HDFS)"
     )
     parser.add_argument(
         "--target-table",

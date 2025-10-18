@@ -90,8 +90,8 @@ def main():
     parser = argparse.ArgumentParser(description="Load dim_pollutant from dim_pollutant.jsonl")
     parser.add_argument(
         "--pollutants",
-        default=os.path.join(os.path.dirname(__file__), "..", "..", "data", "dim_pollutant.jsonl"),
-        help="Path to dim_pollutant.jsonl file"
+        default="hdfs://khoa-master:9000/user/dlhnhom2/data/dim_pollutant.jsonl",
+        help="Path to dim_pollutant.jsonl file (HDFS)"
     )
     parser.add_argument(
         "--target-table",

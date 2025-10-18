@@ -250,9 +250,15 @@ def transform_fact_hourly(
         col("data_completeness")
     )
     
-    # Deduplicate on natural key
+    # Deduplicate records before writing (required for both modes)
     print("Deduplicating records on (location_key, ts_utc)...")
-    df_gold = df_gold.dropDuplicates(["location_key", "ts_utc"])
+    from pyspark.sql import Window
+    from pyspark.sql.functions import row_number
+    
+    window_spec = Window.partitionBy("location_key", "ts_utc").orderBy(col("record_id").desc())
+    df_gold = df_gold.withColumn("_row_num", row_number().over(window_spec)) \
+                    .filter(col("_row_num") == 1) \
+                    .drop("_row_num")
     
     # Write to gold
     if mode == "overwrite":
@@ -260,18 +266,22 @@ def transform_fact_hourly(
         df_gold.write.format("iceberg").mode("overwrite").saveAsTable(gold_table)
     else:
         print(f"Merging into gold fact table: {gold_table}")
-        tmp_view = "__tmp_fact_hourly"
-        df_gold.createOrReplaceTempView(tmp_view)
+        # Materialize dedupped data as temp table instead of view to avoid Spark 4.0 bug
+        tmp_table = f"{gold_table}_staging"
+        df_gold.write.format("iceberg").mode("overwrite").saveAsTable(tmp_table)
         
         merge_sql = f"""
         MERGE INTO {gold_table} AS target
-        USING {tmp_view} AS source
+        USING {tmp_table} AS source
         ON target.location_key = source.location_key 
            AND target.ts_utc = source.ts_utc
         WHEN MATCHED THEN UPDATE SET *
         WHEN NOT MATCHED THEN INSERT *
         """
         spark.sql(merge_sql)
+        
+        # Cleanup staging table
+        spark.sql(f"DROP TABLE IF EXISTS {tmp_table}")
     
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
