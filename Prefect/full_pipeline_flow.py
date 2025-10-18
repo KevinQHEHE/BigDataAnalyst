@@ -357,7 +357,6 @@ Examples:
   python Prefect/full_pipeline_flow.py --mode dims-only
         """
     )
-    
     # Pipeline mode
     parser.add_argument(
         "--mode",
