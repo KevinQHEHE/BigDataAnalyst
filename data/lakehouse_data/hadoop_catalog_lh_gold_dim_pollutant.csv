@@ -1,0 +1,11 @@
+pollutant_code,display_name,unit_default,aqi_timespan
+pm25,PM2.5,µg/m³,24h
+pm10,PM10,µg/m³,24h
+o3,Ozone (O₃),µg/m³,8h
+no2,Nitrogen Dioxide (NO₂),µg/m³,1h
+so2,Sulphur Dioxide (SO₂),µg/m³,1h
+co,Carbon Monoxide (CO),µg/m³,8h
+aod,Aerosol Optical Depth,index,
+dust,Dust,µg/m³,
+uv_index,UV Index,index,
+co2,Carbon Dioxide (CO₂),ppm,

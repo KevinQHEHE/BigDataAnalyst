@@ -1,0 +1,4 @@
+location_key,location_name,latitude,longitude,timezone
+hanoi,Hà Nội,21.0278,105.8342,Asia/Ho_Chi_Minh
+hcmc,TP.HCM,10.8231,106.6297,Asia/Ho_Chi_Minh
+danang,Đà Nẵng,16.0544,108.2022,Asia/Ho_Chi_Minh
