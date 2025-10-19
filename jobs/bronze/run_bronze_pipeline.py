@@ -221,10 +221,10 @@ def ingest_location_chunk(spark: SparkSession, location: Dict, start: str, end: 
     future_count = future_mask.sum()
     if future_count > 0:
         pdf = pdf[~future_mask]
-        print(f"    Filtered {future_count} future timestamps (forecast data)")
+        print(f"Filtered {future_count} future timestamps (forecast data)")
     
     if pdf.empty:
-        print(f"    No new data after filtering future timestamps")
+        print(f"No new data after filtering future timestamps")
         return 0
     
     for col in ["aqi", "aqi_pm25", "aqi_pm10", "aqi_no2", "aqi_o3", "aqi_so2", "aqi_co"]:
@@ -285,14 +285,10 @@ def run_backfill(spark: SparkSession, locations: List[Dict], start: str, end: st
     
     return {"total_rows": total_rows, "total_chunks": len(locations) * len(chunks)}
 
-def run_upsert(spark: SparkSession, locations: List[Dict], table: str, 
-               lookback_days: int = 7) -> Dict:
+def run_upsert(spark: SparkSession, locations: List[Dict], table: str) -> Dict:
     """
     Upsert mode: Find latest data in bronze, backfill from that point to today.
     If no data exists in bronze, exit early without ingesting.
-    
-    Args:
-        lookback_days: Not used in new logic, kept for backward compatibility
     """
     print(f"UPSERT: {len(locations)} locations")
     
@@ -326,8 +322,7 @@ def run_upsert(spark: SparkSession, locations: List[Dict], table: str,
     return {"total_rows": total_rows, "locations_processed": locations_with_data}
 
 def execute_ingestion(mode: str, locations_path: str, start_date: Optional[str] = None,
-                      end_date: Optional[str] = None, chunk_days: int = 90, 
-                      lookback_days: int = 7, override: bool = False,
+                      end_date: Optional[str] = None, chunk_days: int = 90, override: bool = False,
                       table: str = "hadoop_catalog.lh.bronze.open_meteo_hourly",
                       warehouse: str = "hdfs://khoa-master:9000/warehouse/iceberg") -> Dict:
     """Prefect-friendly ingestion function."""
@@ -348,7 +343,7 @@ def execute_ingestion(mode: str, locations_path: str, start_date: Optional[str] 
                 table, chunk_days, override,
             )
         else:
-            stats = run_upsert(spark, locations, table, lookback_days)
+            stats = run_upsert(spark, locations, table)
 
         elapsed = time.time() - start_time
 
@@ -374,7 +369,6 @@ def main():
     parser.add_argument("--start-date")
     parser.add_argument("--end-date")
     parser.add_argument("--chunk-days", type=int, default=90)
-    parser.add_argument("--lookback-days", type=int, default=7)
     parser.add_argument("--override", action="store_true")
     parser.add_argument("--table", default="hadoop_catalog.lh.bronze.open_meteo_hourly")
     parser.add_argument("--warehouse", default=os.getenv("WAREHOUSE_URI", "hdfs://khoa-master:9000/warehouse/iceberg"))
@@ -390,7 +384,6 @@ def main():
         start_date=args.start_date,
         end_date=args.end_date,
         chunk_days=args.chunk_days,
-        lookback_days=args.lookback_days,
         override=args.override,
         table=args.table,
         warehouse=args.warehouse
