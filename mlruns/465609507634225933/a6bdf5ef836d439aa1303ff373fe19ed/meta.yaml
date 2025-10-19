@@ -1,0 +1,14 @@
+artifact_uri: mlflow-artifacts:/465609507634225933/a6bdf5ef836d439aa1303ff373fe19ed/artifacts
+end_time: 1760866488878
+entry_point_name: ''
+experiment_id: '465609507634225933'
+lifecycle_stage: active
+run_id: a6bdf5ef836d439aa1303ff373fe19ed
+run_name: pm25_forecast_gbt
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1760864980044
+status: 3
+tags: []
+user_id: dlhnhom2

@@ -1,0 +1,6 @@
+artifact_location: mlflow-artifacts:/465609507634225933
+creation_time: 1760864966114
+experiment_id: '465609507634225933'
+last_update_time: 1760864966114
+lifecycle_stage: active
+name: pm25_forecast
