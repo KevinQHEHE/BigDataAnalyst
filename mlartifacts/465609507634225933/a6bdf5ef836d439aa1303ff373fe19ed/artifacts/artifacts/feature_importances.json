@@ -1,0 +1,56 @@
+{
+  "feature_importances": [
+    {
+      "feature": "pm10",
+      "importance": 0.186832
+    },
+    {
+      "feature": "so2",
+      "importance": 0.12452
+    },
+    {
+      "feature": "aod",
+      "importance": 0.1002
+    },
+    {
+      "feature": "no2",
+      "importance": 0.0828
+    },
+    {
+      "feature": "o3",
+      "importance": 0.077078
+    },
+    {
+      "feature": "hour_cos",
+      "importance": 0.073833
+    },
+    {
+      "feature": "co",
+      "importance": 0.0691
+    },
+    {
+      "feature": "dust",
+      "importance": 0.068823
+    },
+    {
+      "feature": "co2",
+      "importance": 0.067343
+    },
+    {
+      "feature": "hour_sin",
+      "importance": 0.054323
+    },
+    {
+      "feature": "dow_sin",
+      "importance": 0.040566
+    },
+    {
+      "feature": "dow_cos",
+      "importance": 0.029283
+    },
+    {
+      "feature": "uv_index",
+      "importance": 0.025298
+    }
+  ]
+}
