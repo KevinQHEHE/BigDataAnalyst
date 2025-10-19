@@ -147,7 +147,7 @@ def transform_fact_daily(
     
     # Auto-detect new data range for merge mode
     if auto_detect and mode == "merge" and not start_date:
-        print("\n🔍 Auto-detecting new data range...")
+        print("\nAuto-detecting new data range...")
         start_date, end_date = get_new_data_range(spark, hourly_table, daily_table)
         
         if start_date == "NO_NEW_DATA":
@@ -203,6 +203,7 @@ def transform_fact_daily(
     )
     
     # Aggregate by location and date
+    # US EPA standard: daily AQI = max hourly AQI
     df_daily = df_categorized.groupBy("location_key", "date_utc", "date_key").agg(
         _max("aqi").alias("aqi_daily_max"),
         first("dominant_pollutant", ignorenulls=True).alias("dominant_pollutant_daily"),
@@ -288,7 +289,6 @@ def transform_fact_daily(
         "duration_seconds": duration,
         "mode": mode
     }
-
 
 def main():
     parser = argparse.ArgumentParser(description="Transform Gold Hourly → Gold Daily")

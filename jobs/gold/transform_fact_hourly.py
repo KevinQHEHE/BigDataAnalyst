@@ -71,7 +71,7 @@ def get_new_data_range(
         # Check if Gold table exists
         gold_exists = spark.catalog.tableExists(gold_table)
         if not gold_exists:
-            print(f"⊘ Gold table {gold_table} doesn't exist, will process all Silver data")
+            print(f"Gold table {gold_table} doesn't exist, will process all Silver data")
             return None, None
         
         # Get max timestamp in Gold
@@ -81,11 +81,11 @@ def get_new_data_range(
         """).collect()
         
         if not gold_max_row or gold_max_row[0]['max_ts'] is None:
-            print("⊘ Gold table is empty, will process all Silver data")
+            print("Gold table is empty, will process all Silver data")
             return None, None
         
         gold_max_ts = gold_max_row[0]['max_ts']
-        print(f"✓ Latest Gold timestamp: {gold_max_ts}")
+        print(f"Latest Gold timestamp: {gold_max_ts}")
         
         # Get min/max dates in Silver where ts_utc > gold_max
         silver_new_row = spark.sql(f"""
@@ -98,18 +98,18 @@ def get_new_data_range(
         """).collect()
         
         if not silver_new_row or silver_new_row[0]['min_date'] is None:
-            print("✓ No new data in Silver, Gold is up-to-date")
+            print("No new data in Silver, Gold is up-to-date")
             return "NO_NEW_DATA", "NO_NEW_DATA"
         
         min_date = str(silver_new_row[0]['min_date'])
         max_date = str(silver_new_row[0]['max_date'])
         new_count = silver_new_row[0]['count']
         
-        print(f"↻ Found {new_count} new records in Silver: {min_date} to {max_date}")
+        print(f"Found {new_count} new records in Silver: {min_date} to {max_date}")
         return min_date, max_date
         
     except Exception as e:
-        print(f"⚠ Error detecting new data range: {e}")
+        print(f"Error detecting new data range: {e}")
         print("  Will process all Silver data")
         return None, None
 
@@ -144,7 +144,7 @@ def transform_fact_hourly(
     
     # Auto-detect new data range for merge mode
     if auto_detect and mode == "merge" and not start_date:
-        print("\n🔍 Auto-detecting new data range...")
+        print("\nAuto-detecting new data range...")
         start_date, end_date = get_new_data_range(spark, silver_table, gold_table)
         
         if start_date == "NO_NEW_DATA":
