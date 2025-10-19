@@ -13,8 +13,10 @@ Example:
 from __future__ import annotations
 
 import argparse
+import glob
 import math
 import os
+import shutil
 import sys
 import tempfile
 from typing import Dict, List, Tuple
@@ -329,6 +331,41 @@ def run_training(args: argparse.Namespace) -> Dict[str, object]:
                 )
                 mlflow.log_param("predictions_output_path", args.predictions_output)
 
+            if args.predictions_single_csv:
+                if "://" in args.predictions_single_csv:
+                    raise ValueError(
+                        "--predictions-single-csv only supports local filesystem paths. "
+                        "For distributed/remote storage use --predictions-output."
+                    )
+                temp_dir = tempfile.mkdtemp(prefix="pm25_predictions_csv_")
+                try:
+                    selected_cols = ["location_key", "ts_utc", "label", "prediction"] + feature_columns
+                    (
+                        predictions.select(*selected_cols)
+                        .coalesce(1)
+                        .write.mode("overwrite")
+                        .option("header", "true")
+                        .csv(temp_dir)
+                    )
+                    part_files = glob.glob(os.path.join(temp_dir, "part-*"))
+                    if part_files:
+                        output_dir = os.path.dirname(args.predictions_single_csv)
+                        if output_dir:
+                            os.makedirs(output_dir, exist_ok=True)
+                        shutil.move(part_files[0], args.predictions_single_csv)
+                    else:
+                        logger.warning("Spark did not materialize part files for predictions; falling back to toPandas().")
+                        pdf = predictions.select(*selected_cols).toPandas()
+                        output_dir = os.path.dirname(args.predictions_single_csv)
+                        if output_dir:
+                            os.makedirs(output_dir, exist_ok=True)
+                        pdf.to_csv(args.predictions_single_csv, index=False)
+
+                    mlflow.log_param("predictions_single_csv_path", args.predictions_single_csv)
+                    mlflow.log_artifact(args.predictions_single_csv, artifact_path="artifacts/full_predictions")
+                finally:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+
             mlflow.spark.log_model(best_model, artifact_path="model")
 
             print("=" * 70)
@@ -346,6 +383,7 @@ def run_training(args: argparse.Namespace) -> Dict[str, object]:
                 "feature_importances": importances,
                 "experiment_name": args.experiment_name,
                 "predictions_output": args.predictions_output,
+                "predictions_single_csv": args.predictions_single_csv,
             }
     except Exception as e:
         logger.error(f"Training pipeline failed: {e}", exc_info=True)
@@ -423,6 +461,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--predictions-output",
         help="Optional path (local or distributed FS) to write full test predictions as CSV directory.",
+    )
+    parser.add_argument(
+        "--predictions-single-csv",
+        help="Optional local file path to write full test predictions as a single CSV file.",
     )
     parser.add_argument(
         "--spark-mode",
